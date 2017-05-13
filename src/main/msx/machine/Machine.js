@@ -1,66 +1,108 @@
 // Copyright 2015 by Paulo Augusto Peccin. See license.txt distributed with this file.
 
 wmsx.Machine = function() {
+"use strict";
+
     var self = this;
 
     function init() {
-        mainComponentsCreate();
         socketsCreate();
-        setVideoStandardAuto();
+        mainComponentsCreate();
+        self.setMachine(WMSX.MACHINE);
+        self.setDefaults();
         setVSynchMode(WMSX.SCREEN_VSYNCH_MODE);
     }
 
-    this.powerOn = function(paused) {
+    this.setMachine = function(name) {
+        this.machineName = name;
+        this.machineType = WMSX.MACHINES_CONFIG[name].type || 3;
+        vdp.setMachineType(this.machineType);
+        rtc.setMachineType(this.machineType);
+        syf.setMachineType(this.machineType);
+    };
+
+    this.powerOn = function() {
         if (this.powerIsOn) this.powerOff();
-        if (rtc) rtc.powerOn();
         bus.powerOn();
+        if (syf) syf.powerOn();
+        if (rtc) rtc.powerOn();
         ppi.powerOn();
         psg.powerOn();
         vdp.powerOn();
         cpu.powerOn();
+        this.reset();
         this.powerIsOn = true;
-        machineControlsSocket.fireRedefinitionUpdate();
-        if (!paused) mainClock.go();
+        machineControlsSocket.firePowerAndUserPauseStateUpdate();
+        if (!mainVideoClock.isRunning()) mainVideoClock.go();
     };
 
     this.powerOff = function() {
-        mainClock.pause();
         cpu.powerOff();
         vdp.powerOff();
         psg.powerOff();
         ppi.powerOff();
         if (rtc) rtc.powerOff();
+        if (syf) syf.powerOff();
         bus.powerOff();
+        controllersSocket.resetControllers();
         this.powerIsOn = false;
-        machineControlsSocket.fireRedefinitionUpdate();
+        if (userPaused) this.userPause(false);
+        else machineControlsSocket.firePowerAndUserPauseStateUpdate();
     };
 
     this.reset = function() {
-        bus.reset();
+        videoStandardSoft = null;
+        if (videoStandardIsAuto) setVideoStandardAuto();
+        controllersSocket.resetControllers();
+        if (syf) syf.reset();
+        if (rtc) rtc.reset();
+        psg.reset();
         vdp.reset();
         cpu.reset();
+        bus.reset();
+        audioSocket.flushAllSignals();
     };
 
-    this.userPowerOn = function(autoRunCassette) {
+    this.userPowerOn = function(basicAutoRun) {
         if (isLoading) return;
-        if (!getBIOS()) {
-            this.getVideoOutput().showOSD("Insert BIOS!", true);
+        if (!bios) {
+            this.getVideoOutput().showOSD("Insert BIOS!", true, true);
             return;
         }
-
         this.powerOn();
-        if (autoRunCassette) cassetteSocket.typeAutoRunCommandAfterPowerOn();
+        if (basicAutoRun) typeBasicAutoRunCommand();
      };
 
-    this.clockPulse = function() {
-        joysticksSocket.clockPulse();
-        if (debugPause)
-            if (debugPauseMoreFrames-- <= 0) return;
-        vdp.clockPulse();
+    this.videoClockPulse = function() {
+        if (systemPaused) return;
+
+        if (bios) bios.getKeyboardExtension().keyboardExtensionClockPulse();
+        controllersSocket.controllersClockPulse();
+
+        if (!self.powerIsOn) return;
+
+        if (userPaused && userPauseMoreFrames-- <= 0) return;
+
+        vdp.videoClockPulse();
+
+        // Finish audio signal (generate any missing samples to adjust to sample rate)
+        audioSocket.audioFinishFrame();
+    };
+
+    this.getMachineTypeSocket = function() {
+        return machineTypeSocket;
+    };
+
+    this.getSlotSocket = function() {
+        return slotSocket;
     };
 
     this.getBIOSSocket = function() {
         return biosSocket;
+    };
+
+    this.getExtensionsSocket = function() {
+        return extensionsSocket;
     };
 
     this.getExpansionSocket = function() {
@@ -75,20 +117,16 @@ wmsx.Machine = function() {
         return machineControlsSocket;
     };
 
-    this.getKeyboardSocket = function() {
-        return keyboardSocket;
-    };
-
-    this.getJoysticksSocket = function() {
-        return joysticksSocket;
+    this.getControllersSocket = function() {
+        return controllersSocket;
     };
 
     this.getVideoOutput = function() {
         return vdp.getVideoOutput();
     };
 
-    this.getAudioOutput = function() {
-        return psg.getAudioOutput();
+    this.getAudioSocket = function() {
+        return audioSocket;
     };
 
     this.getSavestateSocket = function() {
@@ -103,238 +141,334 @@ wmsx.Machine = function() {
         return diskDriveSocket;
     };
 
-    this.showOSD = function(message, overlap) {
-        this.getVideoOutput().showOSD(message, overlap);
+    this.showOSD = function(message, overlap, error) {
+        this.getVideoOutput().showOSD(message, overlap, error);
     };
 
-    this.loading = function(boo) {
-        isLoading = boo;
+    this.setVideoStandardSoft = function(pVideoStandard) {
+        videoStandardSoft = pVideoStandard;
+        if (videoStandardIsAuto && videoStandard !== pVideoStandard) setVideoStandard(pVideoStandard);
+        else if (!videoStandardIsAuto && videoStandard !== pVideoStandard)
+                self.showOSD("Cannot change Video Standard. Its FORCED: " + videoStandard.desc, true, true);
     };
 
-    var setBIOS = function(bios) {
-        bus.insertSlot(bios || wmsx.SlotEmpty.singleton, BIOS_SLOT);
+    this.setLoading = function(state) {
+        isLoading = state;
+    };
+
+    this.userPause = function(pause, keepAudio) {
+        var prev = userPaused;
+        if (userPaused !== pause) {
+            userPaused = !!pause; userPauseMoreFrames = -1;
+            if (userPaused && !keepAudio) audioSocket.muteAudio();
+            else audioSocket.unMuteAudio();
+            machineControlsSocket.firePowerAndUserPauseStateUpdate();
+        }
+        return prev;
+    };
+
+    this.systemPause = function(val) {
+        var prev = systemPaused;
+        if (systemPaused !== val) {
+            systemPaused = !!val;
+            if (systemPaused) audioSocket.pauseAudio();
+            else audioSocket.unpauseAudio();
+        }
+        return prev;
+    };
+
+    this.isSystemPaused = function() {
+        return systemPaused;
+    };
+
+    this.setBIOS = function(pBIOS) {                    // Called by SlotBIOS on connection
+        bios = pBIOS === EMPTY_SLOT ? null : pBIOS;
+        videoStandardSoft = null;
         setVideoStandardAuto();
     };
 
-    var getBIOS = function() {
-        var bios = bus.getSlot(BIOS_SLOT);
-        return bios === wmsx.SlotEmpty.singleton ? null : bios;
+    this.setDefaults = function() {
+        setVideoStandardAuto();
+        vdp.setDefaults();
+        speedControl = 1;
+        alternateSpeed = null;
+        mainVideoClockUpdateSpeed();
     };
 
-    var setCartridge = function(cartridge, port) {
-        var slot = cartridge || wmsx.SlotEmpty.singleton;
-        if (port === 1)
-            bus.getSlot(EXPANDED_SLOT).insertSubSlot(slot, CARTRIDGE1_EXP_SLOT);
-        else
-            bus.insertSlot(slot, cartridge0Slot);
-        cartridgeSocket.fireStateUpdate();
-    };
+    function getSlot(slotPos) {
+        if (typeof slotPos === "number") slotPos = [slotPos];
+        var pri = slotPos[0], sec = slotPos[1];
 
-    var getCartridge = function(port) {
-        var cartridge = port === 1 ? bus.getSlot(EXPANDED_SLOT).getSubSlot(CARTRIDGE1_EXP_SLOT) : bus.getSlot(cartridge0Slot);
-        return cartridge === wmsx.SlotEmpty.singleton ? null : cartridge;
-    };
+        var res = bus.getSlot(pri);
+        if (sec >= 0) {
+            if (res.isExpanded()) res = res.getSubSlot(sec);
+            else res = null;
+        } else {
+            if (res.isExpanded()) res = res.getSubSlot(0);
+        }
+        return res;
+    }
 
-    var setExpansion = function(expansion, port) {
-        var slot = expansion || wmsx.SlotEmpty.singleton;
-        bus.getSlot(EXPANDED_SLOT).insertSubSlot(slot, EXPANSIONS_EXP_SLOTS[port]);
-    };
+    function getSlotDesc(slotPos) {
+        var pri = typeof slotPos === "number" ? slotPos : slotPos[0];
+        return pri.toString() + (bus.getSlot(pri).isExpanded() ? "-" + (slotPos[1] || 0) : "");
+    }
 
-    var getExpansion = function(port) {
-        var expansion = bus.getSlot(EXPANDED_SLOT).getSubSlot(EXPANSIONS_EXP_SLOTS[port]);
-        return expansion === wmsx.SlotEmpty.singleton ? null : expansion;
-    };
+    function insertSlot(slot, slotPos) {
+        if (typeof slotPos === "number") slotPos = [slotPos];
 
-    var setVideoStandard = function(pVideoStandard) {
-        self.showOSD((videoStandardIsAuto ? "AUTO: " : "") + pVideoStandard.desc, false);
-        if (videoStandard === pVideoStandard) return;
+        if ((!slot || slot === EMPTY_SLOT) && (getSlot(slotPos) || EMPTY_SLOT) === EMPTY_SLOT) return;
+
+        var pri = slotPos[0], sec = slotPos[1];
+
+        var curPriSlot = bus.getSlot(pri);
+        if (sec >= 0) {
+            if (!curPriSlot.isExpanded()) {
+                var oldPriSlot = curPriSlot;
+                // Automatically insert an ExpandedSlot if not present. SpecialExpandedSlot for primary slot 2
+                curPriSlot = pri === 2 ? new wmsx.SlotExpandedSpecial() : new wmsx.SlotExpanded();
+                bus.insertSlot(curPriSlot, pri);
+                if (oldPriSlot !== EMPTY_SLOT) curPriSlot.insertSubSlot(oldPriSlot, sec === 0 ? 1 : 0);
+            }
+            curPriSlot.insertSubSlot(slot, sec);
+        } else {
+            if (curPriSlot.isExpanded()) {
+                curPriSlot.insertSubSlot(slot, 0);
+            } else
+                bus.insertSlot(slot, pri);
+        }
+    }
+
+    function setVideoStandard(pVideoStandard, forceUpdate) {
+        self.showOSD((videoStandardIsAuto ? "AUTO: " : "FORCED: ") + pVideoStandard.desc, false);
+        if (!forceUpdate && videoStandard === pVideoStandard) return;
 
         videoStandard = pVideoStandard;
         vdp.setVideoStandard(videoStandard);
-        mainClockAdjustToNormal();
-    };
+        mainVideoClockUpdateSpeed();
+    }
 
-    var setVideoStandardAuto = function() {
+    function setVideoStandardAuto() {
         videoStandardIsAuto = true;
-        var bios = getBIOS();
-        if (bios) bios.setVideoStandardUseOriginal();
-        setVideoStandard((bios && bios.originalVideoStandard) || wmsx.VideoStandard.NTSC);
-    };
+        var newStandard = wmsx.VideoStandard.NTSC;          // Default in case we can't discover it
+        if (videoStandardSoft) {
+            newStandard = videoStandardSoft;
+        } else {
+            if (bios) {
+                bios.setVideoStandardUseOriginal();
+                newStandard = bios.originalVideoStandard;
+            }
+        }
+        setVideoStandard(newStandard, true);
+    }
 
-    var setVideoStandardForced = function(forcedVideoStandard) {
+    function setVideoStandardForced(forcedVideoStandard) {
         videoStandardIsAuto = false;
-        if (getBIOS()) getBIOS().setVideoStandardForced(forcedVideoStandard);
+        if (bios) bios.setVideoStandardForced(forcedVideoStandard);
         setVideoStandard(forcedVideoStandard);
-    };
+    }
 
-    var setVSynchMode = function(mode) {
-        mode %= 3;
+    function setVSynchMode(mode) {
         if (vSynchMode === mode) return;
-
-        vSynchMode = mode;
+        if (vSynchMode !== -1) vSynchMode = mode % 2;
         vdp.setVSynchMode(vSynchMode);
-        mainClockAdjustToNormal();
-    };
+        mainVideoClockUpdateSpeed();
+    }
 
-    var powerFry = function() {
+    function powerFry() {
         //ram.powerFry();
-    };
+    }
 
-    var saveState = function() {
+    function saveState() {
         return {
-            rs: ramSlot,
-            c0s: cartridge0Slot,
+            mn: self.machineName,
+            mt: self.machineType,
             b:  bus.saveState(),
+            rc: rtc.saveState(),
+            sf: syf.saveState(),
             pp: ppi.saveState(),
             ps: psg.saveState(),
             vd: vdp.saveState(),
             c:  cpu.saveState(),
             va: videoStandardIsAuto,
             vs: videoStandard.name,
+            s: speedControl,
+            br: basicAutoRunDone,
+            vss: videoStandardSoft && videoStandardSoft.name,
             dd: diskDriveSocket.getDrive().saveState(),
-            ct: cassetteSocket.getDeck().saveState()
+            ct: cassetteSocket.getDeck().saveState(),
+            cs: controllersSocket.saveState()
         };
-    };
+    }
 
-    var loadState = function(state) {
-        videoStandardIsAuto = state.va;
-        setVideoStandard(wmsx.VideoStandard[state.vs]);
-        ramSlot = state.rs === undefined ? 1 : state.rs;                 // Backward compatibility
-        cartridge0Slot = state.c0s === undefined ? 2 : state.c0s;        // Backward compatibility
-        bus.loadState(state.b);
-        ppi.loadState(state.pp);
-        psg.loadState(state.ps);
-        vdp.loadState(state.vd);
-        cpu.loadState(state.c);
-        self.ram = bus.getSlot(ramSlot);
-        machineControlsSocket.fireRedefinitionUpdate();
-        cartridgeSocket.fireStateUpdate();
-        diskDriveSocket.getDrive().loadState(state.dd);
-        cassetteSocket.getDeck().loadState(state.ct);
-    };
+    function loadState(s) {
+        self.machineName = s.mn;
+        self.machineType = s.mt;
+        videoStandardIsAuto = s.va;
+        setVideoStandard(wmsx.VideoStandard[s.vs]);
+        videoStandardSoft = s.vss && wmsx.VideoStandard[s.vss];
+        speedControl = s.s || 1;
+        basicAutoRunDone = !!s.br;
+        mainVideoClockUpdateSpeed();
+        cpu.loadState(s.c);
+        vdp.loadState(s.vd);
+        psg.loadState(s.ps);
+        ppi.loadState(s.pp);
+        rtc.loadState(s.rc);
+        syf.loadState(s.sf);
+        bus.loadState(s.b);
+        diskDriveSocket.getDrive().loadState(s.dd);
+        cassetteSocket.getDeck().loadState(s.ct);
+        if (s.cs) controllersSocket.loadState(s.cs);
+        machineTypeSocket.fireMachineTypeStateUpdate();
+        cartridgeSocket.fireCartridgesStateUpdate();        // Will perform a complete Extensions refresh from Slots
+        machineControlsSocket.firePowerAndUserPauseStateUpdate();
+        audioSocket.flushAllSignals();
+    }
 
-    var mainClockAdjustToNormal = function() {
+    function mainVideoClockUpdateSpeed() {
         var freq = vdp.getDesiredBaseFrequency();
-        mainClock.setVSynch(vSynchMode > 0);
-        mainClock.setFrequency(freq);
-        psg.getAudioOutput().setFps(freq);
-    };
+        mainVideoClock.setVSynch(vSynchMode > 0);
+        mainVideoClock.setFrequency((freq * (alternateSpeed || speedControl)) | 0);
+        audioSocket.setFps(freq);
+    }
 
-    var mainClockAdjustToFast = function() {
-        var freq = 360;     // About 6x faster if host machine is capable
-        mainClock.setFrequency(freq);
-        psg.getAudioOutput().setFps(freq);
-    };
+    function mainComponentsCreate() {
+        // Main clock will be the VDP VideoClock (60Hz/50Hz)
+        // CPU and other clocks (CPU and AudioClocks dividers) will be sent by the VDP
+        self.mainVideoClock = mainVideoClock = new wmsx.Clock(self.videoClockPulse);
 
-    var mainClockAdjustToSlow = function() {
-        var freq = 20;      // About 3x slower
-        mainClock.setFrequency(freq);
-        psg.getAudioOutput().setFps(freq);
-    };
-
-    var mainComponentsCreate = function() {
-        self.mainClock = mainClock = new wmsx.Clock(self);
         self.cpu = cpu = new wmsx.Z80();
-        self.psg = psg = new wmsx.PSG();
-        self.ppi = ppi = new wmsx.PPI(psg.getAudioOutput());
-        self.vdp = vdp = new wmsx.V9938(cpu, psg, !MSX2);
-        if (MSX2) self.rtc = rtc = new wmsx.RTC();
-
-        self.bus = bus = new wmsx.EngineBUS(self, cpu);
+        self.vdp = vdp = new wmsx.VDP(self, cpu);
+        self.psg = psg = new wmsx.PSG(audioSocket, controllersSocket);
+        self.ppi = ppi = new wmsx.PPI(psg.getAudioChannel(), controllersSocket);
+        self.rtc = rtc = new wmsx.RTC();
+        self.syf = syf = new wmsx.SystemFlags();
+        self.bus = bus = new wmsx.BUS(self, cpu);
         cpu.connectBus(bus);
         ppi.connectBus(bus);
         vdp.connectBus(bus);
         psg.connectBus(bus);
-        if (rtc) rtc.connectBus(bus);
+        rtc.connectBus(bus);
+        syf.connectBus(bus);
+    }
 
-        // RAM
-        self.ram = MSX2 ? wmsx.SlotRAMMapper256K.createNewEmpty() : wmsx.SlotRAM64K.createNewEmpty();
-        bus.insertSlot(self.ram, ramSlot);
-
-        // Expanded Slot
-        bus.insertSlot(new wmsx.SlotExpanded(), EXPANDED_SLOT);
-    };
-
-    var socketsCreate = function() {
-        machineControlsSocket = new MachineControlsSocket();
-        machineControlsSocket.addForwardedInput(self);
+    function socketsCreate() {
+        machineTypeSocket = new wmsx.MachineTypeSocket(self);
+        slotSocket = new SlotSocket();
         biosSocket = new BIOSSocket();
-        expansionSocket = new ExpansionSocket();
+        extensionsSocket = new wmsx.ExtensionsSocket(self);
         cartridgeSocket = new CartridgeSocket();
-        keyboardSocket = new KeyboardSocket();
-        joysticksSocket = new JoysticksSocket();
+        expansionSocket = new ExpansionSocket();
+        controllersSocket = new ControllersSocket();
         saveStateSocket = new SaveStateSocket();
         cassetteSocket = new CassetteSocket();
+        audioSocket = new AudioSocket();
         diskDriveSocket = new DiskDriveSocket();
-    };
+        machineControlsSocket = new MachineControlsSocket();
+    }
+
+    function typeBasicAutoRunCommand() {
+        if (!basicAutoRunDone) {
+            var type = WMSX.BASIC_ENTER ? WMSX.BASIC_ENTER + "\r" : "";
+            type += WMSX.BASIC_TYPE || "";
+            if (WMSX.BASIC_RUN)        bios.getKeyboardExtension().typeString('\r\r\rRUN "' + WMSX.BASIC_RUN + '"\r' + type);
+            else if (WMSX.BASIC_LOAD)  bios.getKeyboardExtension().typeString('\r\r\rLOAD "' + WMSX.BASIC_LOAD + '"\r' + type);
+            else if (WMSX.BASIC_BRUN)  bios.getKeyboardExtension().typeString('\r\r\rBLOAD "' + WMSX.BASIC_BRUN + '",r\r' + type);
+            else if (WMSX.BASIC_BLOAD) bios.getKeyboardExtension().typeString('\r\r\rBLOAD "' + WMSX.BASIC_BLOAD + '"\r' + type);
+            else {
+                cassetteSocket.typeAutoRunCommand();
+                if (type) bios.getKeyboardExtension().typeString(type);
+            }
+
+            basicAutoRunDone = true;
+        } else
+            cassetteSocket.typeAutoRunCommand();
+    }
 
 
+    this.machineName = null;
+    this.machineType = 0;
     this.powerIsOn = false;
 
-    var isLoading = false;
+    var speedControl = 1;
+    var alternateSpeed = false;
 
-    var mainClock;
+    var isLoading = false;
+    var basicAutoRunDone = false;
+
+    var mainVideoClock;
     var cpu;
     var bus;
     var ppi;
     var vdp;
     var psg;
-    var rtc;        // MSX2 only
+    var rtc;
+    var syf;
 
-    var debugPause = false;
-    var debugPauseMoreFrames = 0;
+    var userPaused = false;
+    var userPauseMoreFrames = 0;
+    var systemPaused = false;
 
-    var machineControlsSocket;
-    var keyboardSocket;
-    var joysticksSocket;
+    var machineTypeSocket;
+    var slotSocket;
     var biosSocket;
+    var extensionsSocket;
     var expansionSocket;
     var cartridgeSocket;
     var saveStateSocket;
     var cassetteSocket;
     var diskDriveSocket;
+    var machineControlsSocket;
+    var controllersSocket;
+    var audioSocket;
 
+    var bios;
     var videoStandard;
+    var videoStandardSoft;
     var videoStandardIsAuto = false;
+
     var vSynchMode;
 
+    var BIOS_SLOT = WMSX.BIOS_SLOT;
+    var CARTRIDGE0_SLOT = WMSX.CARTRIDGE1_SLOT;
+    var CARTRIDGE1_SLOT = WMSX.CARTRIDGE2_SLOT;
+    var EXPANSIONS_SLOTS = WMSX.EXPANSION_SLOTS;
+    var EMPTY_SLOT = wmsx.SlotEmpty.singleton;
 
-    var MSX2 = WMSX.MACHINE_TYPE === 2;
-
-    var BIOS_SLOT = 0;
-    var RAM_SLOT = WMSX.RAM_SLOT;
-    var CARTRIDGE0_SLOT = RAM_SLOT === 1 ? 2 : 1;
-    var EXPANDED_SLOT = 3;
-    var CARTRIDGE1_EXP_SLOT = 3;
-    var EXPANSIONS_EXP_SLOTS = [ 0, 1, 2 ];
-
-    var ramSlot = RAM_SLOT;
-    var cartridge0Slot = CARTRIDGE0_SLOT;
+    var SPEEDS = [ 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 2, 3, 5, 10 ];
+    var SPEED_FAST = 10, SPEED_SLOW = 0.3;
 
 
     // MachineControls interface  --------------------------------------------
 
     var controls = wmsx.MachineControls;
 
-    this.controlStateChanged = function (control, state) {
+    function controlStateChanged(control, state) {
+        if (isLoading || systemPaused) return;
+
         // Normal state controls
         if (control === controls.FAST_SPEED) {
-            if (state) {
+            if (state && alternateSpeed !== SPEED_FAST) {
+                alternateSpeed = SPEED_FAST;
+                mainVideoClockUpdateSpeed();
                 self.showOSD("FAST FORWARD", true);
-                mainClockAdjustToFast();
-            } else {
+            } else if (!state && alternateSpeed === SPEED_FAST) {
+                alternateSpeed = null;
+                mainVideoClockUpdateSpeed();
                 self.showOSD(null, true);
-                mainClockAdjustToNormal();
             }
             return;
         }
         if (control === controls.SLOW_SPEED) {
-            if (state) {
+            if (state && alternateSpeed !== SPEED_SLOW) {
+                alternateSpeed = SPEED_SLOW;
+                mainVideoClockUpdateSpeed();
                 self.showOSD("SLOW MOTION", true);
-                mainClockAdjustToSlow();
-            } else {
+            } else if (!state && alternateSpeed === SPEED_SLOW) {
+                alternateSpeed = null;
+                mainVideoClockUpdateSpeed();
                 self.showOSD(null, true);
-                mainClockAdjustToNormal();
             }
             return;
         }
@@ -343,7 +477,7 @@ wmsx.Machine = function() {
         switch (control) {
             case controls.POWER:
                 if (self.powerIsOn) self.powerOff();
-                else self.userPowerOn();
+                else self.userPowerOn(false);
                 break;
             case controls.RESET:
                 if (self.powerIsOn) self.reset();
@@ -355,22 +489,42 @@ wmsx.Machine = function() {
                 powerFry();
                 break;
             case controls.PAUSE:
-                debugPause = !debugPause; debugPauseMoreFrames = 1;
-                vdp.getVideoOutput().showOSD(debugPause ? "PAUSE" : "RESUME", true);
+                self.userPause(!userPaused, false);
+                self.getVideoOutput().showOSD(userPaused ? "PAUSE" : "RESUME", true);
+                return;
+            case controls.PAUSE_AUDIO_ON:
+                self.userPause(!userPaused, true);
+                self.getVideoOutput().showOSD(userPaused ? "PAUSE with AUDIO ON" : "RESUME", true);
                 return;
             case controls.FRAME:
-                if (debugPause) debugPauseMoreFrames = 1;
+                if (userPaused) userPauseMoreFrames = 1;
+                return;
+            case controls.INC_SPEED: case controls.DEC_SPEED: case controls.NORMAL_SPEED: case controls.MIN_SPEED:
+                var speedIndex = SPEEDS.indexOf(speedControl);
+                if (control === controls.INC_SPEED && speedIndex < SPEEDS.length - 1) ++speedIndex;
+                else if (control === controls.DEC_SPEED && speedIndex > 0) --speedIndex;
+                else if (control === controls.MIN_SPEED) speedIndex = 0;
+                else if (control === controls.NORMAL_SPEED) speedIndex = SPEEDS.indexOf(1);
+                speedControl = SPEEDS[speedIndex];
+                self.showOSD("Speed: " + ((speedControl * 100) | 0) + "%", true);
+                mainVideoClockUpdateSpeed();
                 return;
             case controls.SAVE_STATE_0: case controls.SAVE_STATE_1: case controls.SAVE_STATE_2: case controls.SAVE_STATE_3: case controls.SAVE_STATE_4: case controls.SAVE_STATE_5:
             case controls.SAVE_STATE_6: case controls.SAVE_STATE_7: case controls.SAVE_STATE_8: case controls.SAVE_STATE_9: case controls.SAVE_STATE_10: case controls.SAVE_STATE_11: case controls.SAVE_STATE_12:
+                var wasPaused = self.systemPause(true);
                 saveStateSocket.saveState(control.to);
+                if (!wasPaused) self.systemPause(false);
                 break;
             case controls.SAVE_STATE_FILE:
+                wasPaused = self.systemPause(true);
                 saveStateSocket.saveStateFile();
+                if (!wasPaused) self.systemPause(false);
                 break;
             case controls.LOAD_STATE_0: case controls.LOAD_STATE_1: case controls.LOAD_STATE_2: case controls.LOAD_STATE_3: case controls.LOAD_STATE_4: case controls.LOAD_STATE_5:
             case controls.LOAD_STATE_6: case controls.LOAD_STATE_7: case controls.LOAD_STATE_8: case controls.LOAD_STATE_9: case controls.LOAD_STATE_10: case controls.LOAD_STATE_11: case controls.LOAD_STATE_12:
+                wasPaused = self.systemPause(true);
                 saveStateSocket.loadState(control.from);
+                if (!wasPaused) self.systemPause(false);
                 break;
             case controls.VIDEO_STANDARD:
                 self.showOSD(null, true);	// Prepares for the upcoming "AUTO" OSD to always show
@@ -379,46 +533,39 @@ wmsx.Machine = function() {
                 else setVideoStandardAuto();
                 break;
             case controls.VSYNCH:
-                if (wmsx.Clock.HOST_NATIVE_FPS === -1) {
-                    self.showOSD("V-Synch is disabled / unsupported", true);
+                if (vSynchMode === -1 || wmsx.Clock.HOST_NATIVE_FPS === -1) {
+                    self.showOSD("V-Synch is disabled / unsupported", true, true);
                 } else {
                     setVSynchMode(vSynchMode + 1);
-                    self.showOSD("V-Synch: " + (vSynchMode === 1 ? "AUTO" : vSynchMode === 0 ? "DISABLED" : "FORCED"), true);
+                    self.showOSD("V-Synch: " + (vSynchMode === 1 ? "ON" : vSynchMode === 0 ? "OFF" : "DISABLED"), true);
                 }
+                break;
+            case controls.CPU_TURBO_MODE:
+                cpu.toggleTurboMode();
+                self.showOSD("CPU Turbo Speed: " + (cpu.getTurboMode() ? "2x (7.16 MHz)" : "OFF (3.58 MHz)"), true);
                 break;
             case controls.PALETTE:
                 vdp.togglePalettes();
                 break;
             case controls.DEBUG:
-                vdp.toggleDebugModes();
+                var resultingMode = vdp.toggleDebugModes();
+                wmsx.DeviceMissing.setDebugMode(resultingMode);
                 break;
             case controls.SPRITE_MODE:
                 vdp.toggleSpriteDebugModes();
                 break;
-            case controls.DEFAULTS:
-                setVideoStandardAuto();
-                vdp.setDefaults();
-                break;
         }
-    };
-
-    this.controlsStateReport = function (report) {
-        //  Only Power Control is visible from outside
-        report[controls.POWER] = self.powerIsOn;
-    };
+    }
 
 
     // BIOS Socket  -----------------------------------------
 
     function BIOSSocket() {
         this.insert = function (bios, altPower) {
-            var powerWasOn = self.powerIsOn;
-            if (powerWasOn) self.powerOff();
-            setBIOS(bios);
-            if (!altPower && bios) self.userPowerOn();
+            slotSocket.insert(bios, BIOS_SLOT, altPower);
         };
         this.inserted = function () {
-            return getBIOS();
+            return bios;
         };
     }
 
@@ -427,14 +574,12 @@ wmsx.Machine = function() {
 
     function ExpansionSocket() {
         this.insert = function (expansion, port, altPower) {
-            var powerWasOn = self.powerIsOn;
-            if (powerWasOn) self.powerOff();
-            if (expansion == getExpansion(port || 0)) return;
-            setExpansion(expansion, port);
-            if (!altPower && (expansion || powerWasOn)) self.userPowerOn();
+            if (expansion == slotSocket.inserted(EXPANSIONS_SLOTS[port || 0])) return;
+            slotSocket.insert(expansion, EXPANSIONS_SLOTS[port || 0], altPower);
+            self.showOSD("Expansion " + (port === 1 ? "2" : "1") + ": " + (expansion ? expansion.rom.source : "EMPTY"), true);
         };
         this.inserted = function (port) {
-            return getExpansion(port);
+            return slotSocket.inserted(EXPANSIONS_SLOTS[port || 0]);
         };
     }
 
@@ -442,34 +587,134 @@ wmsx.Machine = function() {
     // CartridgeSocket  -----------------------------------------
 
     function CartridgeSocket() {
-
+        this.connectFileDownloader = function (pFileDownloader) {
+            fileDownloader = pFileDownloader;
+        };
         this.insert = function (cartridge, port, altPower) {
-            if (cartridge == getCartridge(port || 0)) return;
-            var powerWasOn = self.powerIsOn;
-            if (powerWasOn) self.powerOff();
-            setCartridge(cartridge, port);
-            self.showOSD("Cartridge " + (port === 1 ? "2" : "1") + (cartridge ? " inserted" : " removed"), true);
-            if (!altPower && (cartridge || powerWasOn)) self.userPowerOn();
+            var slotPos = port === 1 ? CARTRIDGE1_SLOT : CARTRIDGE0_SLOT;
+            if (cartridge === slotSocket.inserted(slotPos)) return;
+            slotSocket.insert(cartridge, slotPos, altPower);
+            this.fireCartridgesStateUpdate();
+            self.showOSD("Cartridge " + (port === 1 ? "2" : "1") + ": " + (cartridge ? cartridge.rom.source : "EMPTY"), true);
         };
-
+        this.remove = function (port, altPower) {
+            var slotPos = port === 1 ? CARTRIDGE1_SLOT : CARTRIDGE0_SLOT;
+            if (slotSocket.inserted(slotPos) === null) return self.showOSD("No Cartridge in Slot " + (port === 1 ? "2" : "1"), true, true);
+            slotSocket.insert(null, slotPos, altPower);
+            this.fireCartridgesStateUpdate();
+            self.showOSD("Cartridge " + (port === 1 ? "2" : "1") + " removed", true);
+        };
         this.inserted = function (port) {
-            return getCartridge(port);
+            return slotSocket.inserted(port === 1 ? CARTRIDGE1_SLOT : CARTRIDGE0_SLOT);
         };
-
-        this.fireStateUpdate = function () {
+        this.dataOperationNotSupportedMessage = function(port, operation, silent) {
+            var slotPos = port === 1 ? CARTRIDGE1_SLOT : CARTRIDGE0_SLOT;
+            var cart = slotSocket.inserted(slotPos);
+            if (cart === null) {
+                if (!silent) self.showOSD("No Cartridge in Slot " + (port === 1 ? "2" : "1"), true, true);
+                return true;
+            }
+            if (!cart.getDataDesc()) {
+                if (!silent)  self.showOSD("Data " + (operation ? "Saving" : "Loading") + " not supported for Cartridge " + (port === 1 ? "2" : "1"), true, true);
+                return true;
+            }
+            return false;
+        };
+        this.loadCartridgeData = function (port, name, arrContent) {
+            var slotPos = port === 1 ? CARTRIDGE1_SLOT : CARTRIDGE0_SLOT;
+            var cart = slotSocket.inserted(slotPos);
+            if (!cart) return null;
+            if (!cart.loadData(wmsx.Util.leafFilename(name), arrContent)) return;
+            self.showOSD(cart.getDataDesc() + " loaded in Cartridge " + (port === 1 ? "2" : "1"), true);
+            return arrContent;
+        };
+        this.saveCartridgeDataFile = function (port) {
+            if (this.dataOperationNotSupportedMessage(port, true, false)) return;
+            var cart = slotSocket.inserted(port === 1 ? CARTRIDGE1_SLOT : CARTRIDGE0_SLOT);
+            var dataToSave = cart.getDataToSave();
+            fileDownloader.startDownloadBinary(dataToSave.fileName, dataToSave.content, cart.getDataDesc());
+        };
+        this.fireCartridgesStateUpdate = function () {
             for (var i = 0; i < listeners.length; i++)
-                listeners[i].cartridgesStateUpdate(this.inserted(0), this.inserted(1));
+                listeners[i].cartridgesStateUpdate();
         };
-
-        this.addCartridgesStateListener = function (listener) {
+        this.addCartridgesStateListener = function (listener, silent) {
             if (listeners.indexOf(listener) < 0) {
                 listeners.push(listener);
-                listener.cartridgesStateUpdate(this.inserted(0), this.inserted(1));		// Fire event
+                if (!silent) listener.cartridgesStateUpdate();
             }
         };
-
+        var fileDownloader;
         var listeners = [];
+    }
 
+
+    // Slot Socket  ---------------------------------------------
+
+    function SlotSocket() {
+        this.insert = function (slot, slotPos, altPower) {
+            var powerWasOn = self.powerIsOn;
+            if (powerWasOn && !altPower) self.powerOff();
+            insertSlot(slot, slotPos);
+            if (!altPower && (slot || powerWasOn)) self.userPowerOn(false);
+            else if (slot && self.powerIsOn) slot.powerOn();
+        };
+        this.inserted = function (slotPos) {
+            var res = getSlot(slotPos);
+            return res === EMPTY_SLOT ? null : res;
+        };
+        this.getSlotDesc = function (slotPos) {
+            return getSlotDesc(slotPos);
+        }
+    }
+
+
+    // Audio Socket  ---------------------------------------------
+
+    function AudioSocket() {
+        this.connectMonitor = function (pMonitor) {
+            monitor = pMonitor;
+            for (var i = signals.length - 1; i >= 0; i--) monitor.connectAudioSignal(signals[i]);
+        };
+        this.connectAudioSignal = function(signal) {
+            if (signals.indexOf(signal) >= 0) return;
+            wmsx.Util.arrayAdd(signals, signal);
+            this.flushAllSignals();                            // To always keep signals in synch
+            signal.setFps(fps);
+            if (monitor) monitor.connectAudioSignal(signal);
+        };
+        this.disconnectAudioSignal = function(signal) {
+            wmsx.Util.arrayRemoveAllElement(signals, signal);
+            if (monitor) monitor.disconnectAudioSignal(signal);
+        };
+        this.audioClockPulse32 = function() {
+            for (var i = signals.length - 1; i >= 0; --i) signals[i].audioClockPulse();
+        };
+        this.audioFinishFrame = function() {
+            for (var i = signals.length - 1; i >= 0; --i) signals[i].audioFinishFrame();
+        };
+        this.muteAudio = function() {
+            if (monitor) monitor.mute();
+        };
+        this.unMuteAudio = function() {
+            if (monitor) monitor.unMute();
+        };
+        this.setFps = function(pFps) {
+            fps = pFps;
+            for (var i = signals.length - 1; i >= 0; --i) signals[i].setFps(fps);
+        };
+        this.pauseAudio = function() {
+            if (monitor) monitor.pause();
+        };
+        this.unpauseAudio = function() {
+            if (monitor) monitor.unpause();
+        };
+        this.flushAllSignals = function() {
+            for (var i = signals.length - 1; i >= 0; --i) signals[i].flush();
+        };
+        var signals = [];
+        var monitor;
+        var fps;
     }
 
 
@@ -490,16 +735,11 @@ wmsx.Machine = function() {
         };
         this.autoPowerCycle = function (altPower) {
             // No power cycle by default if machine is on, only auto power on.
-            // With Alt Power, only do power cycle if there is an executable at position
-            if (!driver || !driver.currentAutoRunCommand()) return;     // Only do power cycle if there is an executable at position
-            var powerWasOn = self.powerIsOn;
-            if (powerWasOn && altPower) self.powerOff();
-            if (!self.powerIsOn && (!altPower || (powerWasOn && altPower))) self.userPowerOn(true);
+            if (!driver || !driver.currentAutoRunCommand()) return;     // Only do power-on if there is an executable at position
+            if (!self.powerIsOn && !altPower) self.userPowerOn(true);
         };
-        this.typeAutoRunCommandAfterPowerOn = function () {
-            if (driver && driver.currentAutoRunCommand())
-                // Give some time for reboot and then enter command
-                window.setTimeout(driver.typeCurrentAutoRunCommand, 1700);      // TODO Arbitrary time...
+        this.typeAutoRunCommand = function () {
+            if (driver) driver.typeCurrentAutoRunCommand();
         };
         var deck;
         var driver;
@@ -517,40 +757,54 @@ wmsx.Machine = function() {
         };
         this.autoPowerCycle = function (altPower) {
             // No power cycle by default if machine is on, only auto power on.
-            var powerWasOn = self.powerIsOn;
-            if (powerWasOn && altPower) self.powerOff();
-            if (!self.powerIsOn && (!altPower || (powerWasOn && altPower))) self.userPowerOn(true);
+            if (!self.powerIsOn && !altPower) self.userPowerOn(false);
         };
+        this.dos2CartridgeConnected = function(cart) {
+            dos2Carts.add(cart);
+        };
+        this.dos2CartridgeDisconnected = function(cart) {
+            dos2Carts.delete(cart);
+        };
+        this.isDOS2 = function() {
+            return dos2Carts.size > 0;
+        };
+        var dos2Carts = new Set();
         var drive;
     }
 
 
-    // Keyboard Socket  -----------------------------------------
+    // Controllers / Keyboard Socket  -----------------------------------------
 
-    function KeyboardSocket() {
-        this.keyboardKeyChanged = function(key, press) {
-            ppi.keyboardKeyChanged(key, press);
-        };
-        this.keyboardReset = function() {
-            ppi.keyboardReset();
-        };
-    }
-
-
-    // Joysticks Socket  -----------------------------------------
-
-    function JoysticksSocket() {
+    function ControllersSocket() {
         this.connectControls = function(pControls) {
             controls = pControls;
         };
-        this.controlStateChanged = function(control, state) {
-            psg.joystickControlStateChanged(control, state);
+        this.readKeyboardPort = function(row) {
+            return controls.readKeyboardPort(row);
         };
-        this.controlValueChanged = function(control, value) {
-            psg.joystickControlValueChanged(control, value);
+        this.readControllerPort = function(port) {
+            return controls.readControllerPort(port);
         };
-        this.clockPulse = function() {
-            controls.clockPulse();
+        this.writeControllerPin8Port = function(port, value) {
+            controls.writeControllerPin8Port(port, value);
+        };
+        this.releaseControllers = function() {
+            controls.releaseControllers();
+        };
+        this.resetControllers = function() {
+            controls.resetControllers();
+        };
+        this.controllersClockPulse = function() {
+            controls.controllersClockPulse();
+        };
+        this.getBUSCycles = function() {
+            return cpu.getBUSCycles();
+        };
+        this.saveState = function() {
+            return controls.saveState();
+        };
+        this.loadState = function(s) {
+            controls.loadState(s);
         };
         var controls;
     }
@@ -559,61 +813,44 @@ wmsx.Machine = function() {
     // MachineControls Socket  -----------------------------------------
 
     function MachineControlsSocket() {
-
+        this.setDefaults = function() {
+            self.setDefaults();
+        };
         this.controlStateChanged = function(control, state) {
-            for (var i = 0; i < forwardedInputsCount; i++)
-                forwardedInputs[i].controlStateChanged(control, state);
+            controlStateChanged(control, state);
         };
-
-        this.controlsStateReport = function(report) {
-            for (var i = 0; i < forwardedInputsCount; i++)
-                forwardedInputs[i].controlsStateReport(report);
+        this.addPowerAndUserPauseStateListener = function(listener) {
+            if (powerAndUserPauseStateListeners.indexOf(listener) >= 0) return;
+            powerAndUserPauseStateListeners.push(listener);
+            this.firePowerAndUserPauseStateUpdate();
         };
-
-        this.addForwardedInput = function(input) {
-            forwardedInputs.push(input);
-            forwardedInputsCount = forwardedInputs.length;
+        this.firePowerAndUserPauseStateUpdate = function() {
+            for (var i = 0; i < powerAndUserPauseStateListeners.length; ++i)
+                powerAndUserPauseStateListeners[i].machinePowerAndUserPauseStateUpdate(self.powerIsOn, userPaused);
         };
-
-        this.removeForwardedInput = function(input) {
-            wmsx.Util.arrayRemoveAllElement(forwardedInputs, input);
-            forwardedInputsCount = forwardedInputs.length;
-        };
-
-        this.addRedefinitionListener = function(listener) {
-            if (redefinitionListeners.indexOf(listener) < 0) {
-                redefinitionListeners.push(listener);
-                listener.controlsStatesRedefined();		// Fire a redefinition event
+        this.getControlReport = function(control) {
+            switch (control) {
+                case controls.VIDEO_STANDARD:
+                    return { label: videoStandardIsAuto ? "Auto" : videoStandard.name, active: !videoStandardIsAuto };
+                case controls.CPU_TURBO_MODE:
+                    var mode = cpu.getTurboMode();
+                    return { label: mode ? "7.16 MHz" : "OFF", active: mode };
+                case controls.SPRITE_MODE:
+                    var desc = vdp.getSpriteDebugModeQuickDesc();
+                    return { label: desc, active: desc !== "Normal" };
             }
+            return { label: "Unknown", active: false };
         };
-
-        this.fireRedefinitionUpdate = function() {
-            for (var i = 0; i < redefinitionListeners.length; i++)
-                redefinitionListeners[i].controlsStatesRedefined();
-        };
-
-        var forwardedInputs = [];
-        var forwardedInputsCount = 0;
-        var redefinitionListeners = [];
+        var powerAndUserPauseStateListeners = [];
     }
 
 
     // SavestateSocket  -----------------------------------------
 
     function SaveStateSocket() {
-
         this.connectMedia = function(pMedia) {
             media = pMedia;
         };
-
-        this.getMedia = function() {
-            return media;
-        };
-
-            this.externalStateChange = function() {
-            // Nothing
-        };
-
         this.saveState = function(slot) {
             if (!self.powerIsOn || !media) return;
             var state = saveState();
@@ -621,72 +858,60 @@ wmsx.Machine = function() {
             if (media.saveState(slot, state))
                 self.showOSD("State " + slot + " saved", true);
             else
-                self.showOSD("State " + slot + " save failed", true);
+                self.showOSD("State " + slot + " save FAILED!", true, true);
         };
-
-        this.loadState = function(slot, altPower) {
+        this.loadState = function(slot) {
             if (!media) return;
             var state = media.loadState(slot);
             if (!state) {
-                self.showOSD("State " + slot + " not found", true);
-                return;
+                self.showOSD("State " + slot + " not found!", true, true);
+            } else if (state.v !== VERSION) {
+                self.showOSD("State " + slot + " load failed, wrong version!", true, true);
+            } else {
+                if (!self.powerIsOn) self.powerOn();
+                loadState(state);
+                self.showOSD("State " + slot + " loaded", true);
             }
-            if (state.v !== VERSION) {
-                self.showOSD("State " + slot + " load failed, wrong version", true);
-                return;
-            }
-            if (!altPower && !self.powerIsOn) self.powerOn();
-            loadState(state);
-            self.showOSD("State " + slot + " loaded", true);
         };
-
         this.saveStateFile = function() {
             if (!self.powerIsOn || !media) return;
-            // Use Cartridge label as file name
-            var cart = cartridgeSocket.inserted(0) || cartridgeSocket.inserted(1);
-            var fileName = cart && cart.rom.info.l;
             var state = saveState();
             state.v = VERSION;
-            if (media.saveStateFile(fileName, state))
-                self.showOSD("State File saved", true);
-            else
-                self.showOSD("State File save failed", true);
+            media.saveStateFile(state);
         };
-
-        this.loadStateFile = function(data, altPower) {       // Return true if data was indeed a SaveState
-            if (!media) return;
+        this.loadStateFile = function(data) {       // Returns true if data was indeed a SaveState
+            if (!media) return false;
             var state = media.loadStateFile(data);
-            if (!state) return;
+            if (!state) return false;
             wmsx.Util.log("SaveState file loaded");
             if (state.v !== VERSION) {
-                self.showOSD("State File load failed, wrong version", true);
-                return true;
+                self.showOSD("State File load failed, wrong version!", true, true);
+            } else {
+                if (!self.powerIsOn) self.powerOn();
+                loadState(state);
+                self.showOSD("State File loaded", true);
             }
-            if (!altPower && !self.powerIsOn) self.powerOn();
-            loadState(state);
-            self.showOSD("State File loaded", true);
             return true;
         };
-
         var media;
-        var VERSION = 7;
+        var VERSION = 9;
     }
 
 
     // Debug methods  ------------------------------------------------------
 
     this.runFramesAtTopSpeed = function(frames) {
-        mainClock.pause();
-        var start = performance.now();
+        mainVideoClock.pause();
+        var start = wmsx.Util.performanceNow();
         for (var i = 0; i < frames; i++) {
-            //var pulseTime = window.performance.now();
-            self.clockPulse();
-            //console.log(window.performance.now() - pulseTime);
+            //var pulseTime = wmsx.Util.performanceNow();
+            self.videoClockPulse();
+            //console.log(wmsx.Util.performanceNow() - pulseTime);
         }
-        var duration = performance.now() - start;
-        wmsx.Util.log("Done running " + frames + " frames in " + duration + " ms");
-        wmsx.Util.log(frames / (duration/1000) + "  frames/sec");
-        mainClock.go();
+        var duration = wmsx.Util.performanceNow() - start;
+        wmsx.Util.log("Done running " + frames + " frames in " + (duration | 0) + " ms");
+        wmsx.Util.log((frames / (duration/1000)).toFixed(2) + "  frames/sec");
+        mainVideoClock.go();
     };
 
     this.eval = function(str) {
@@ -697,3 +922,5 @@ wmsx.Machine = function() {
     init();
 
 };
+
+wmsx.Machine.BASE_CPU_CLOCK = 228 * 262 * 60;        // 3584160Hz, rectified to 60Hz (228 clocks per line, 262 lines, 60 fps)

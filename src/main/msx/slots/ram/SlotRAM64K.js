@@ -1,9 +1,14 @@
 // Copyright 2015 by Paulo Augusto Peccin. See license.txt distributed with this file.
 
-wmsx.SlotRAM64K = function(content) {
+// Standard 64K RAM Slot
+// 0x0000 - 0xffff
+
+wmsx.SlotRAM64K = function(rom) {
+"use strict";
 
     function init(self) {
-        bytes = content;
+        self.rom = rom;
+        bytes = wmsx.Util.arrayFill(new Array(65536), 0x00);
         self.bytes = bytes;
     }
 
@@ -26,7 +31,8 @@ wmsx.SlotRAM64K = function(content) {
     var bytes;
     this.bytes = null;
 
-    this.format = wmsx.SlotFormats.RAM64K;
+    this.rom = null;
+    this.format = wmsx.SlotFormats.RAMNormal;
 
 
     // Savestate  -------------------------------------------
@@ -34,28 +40,26 @@ wmsx.SlotRAM64K = function(content) {
     this.saveState = function() {
         return {
             f: this.format.name,
-            b: wmsx.Util.compressUInt8ArrayToStringBase64(bytes)
+            r: this.rom.saveState(),
+            b: wmsx.Util.compressInt8BitArrayToStringBase64(bytes)
         };
     };
 
     this.loadState = function(state) {
-        bytes = wmsx.Util.uncompressStringBase64ToUInt8Array(state.b);
+        this.rom = wmsx.ROM.loadState(state.r);
+        bytes = wmsx.Util.uncompressStringBase64ToInt8BitArray(state.b, bytes);
         this.bytes = bytes;
     };
 
 
-    if (content) init(this);
+    if (rom) init(this);
 
 };
 
 wmsx.SlotRAM64K.prototype = wmsx.Slot.base;
 
-wmsx.SlotRAM64K.createNewEmpty = function() {
-    return new wmsx.SlotRAM64K(wmsx.Util.arrayFill(new Array(65536), 0x00));
-};
-
-wmsx.SlotRAM64K.createFromSaveState = function(state) {
-    var ram = new wmsx.SlotRAM64K();
+wmsx.SlotRAM64K.recreateFromSaveState = function(state, previousSlot) {
+    var ram = previousSlot || new wmsx.SlotRAM64K();
     ram.loadState(state);
     return ram;
 };

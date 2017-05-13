@@ -2,16 +2,16 @@
 
 // This implementation fetches the base opcode at the FIRST clock cycle
 // Then fetches operands and executes all operations of the instruction at the LAST clock cycle
-// PC and SP not checked for 16 bits over/underflow
 // NMI is not supported. All IM modes supported, but data coming from device in bus will always be FFh (MSX). IFF2 is always the same as IFF1
-// Original base clock: 3579545 Hz
+// Original base clock: 3579545 Hz. Rectified to real 60Hz: 3584160Hz
 
 wmsx.Z80 = function() {
+"use strict";
+
     var self = this;
 
     function init() {
         defineAllInstructions();
-        delete defineAllInstructions;
     }
 
     this.powerOn = function() {
@@ -26,17 +26,18 @@ wmsx.Z80 = function() {
     };
 
     this.clockPulses = function(quant) {
-        for (var i = quant; i > 0; i = i - 1) {
-            cycles = cycles + 1;
+        var cpuQuant = quant << turboClockShift;
+        for (var i = cpuQuant; i > 0; --i) {
             if (--T > 1) continue;                   // Still counting cycles of current instruction
-            if (T === 1) {
+            if (T > 0) {
                 instruction.operation();
-                continue;
+            } else {
+                ++R;                                 // Verify: R can have bit 7 = 1 only if set manually. How the increment handles that? Ignoring for now, also do not check for 8 bits overflow
+                if (ackINT) acknowledgeINT();
+                else fetchNextInstruction();
             }
-            R = R + 1;                               // TODO R can have bit 7 = 1 only if set manually. How the increment handles that? Ignoring for now, also do not check for 8 bits overflow
-            if (ackINT) acknowledgeINT();
-            else fetchNextInstruction();
         }
+        busCycles += quant;                          // Quantized bus cycle reporting. Lower precision, better performance
     };
 
     this.connectBus = function(aBus) {
@@ -49,7 +50,7 @@ wmsx.Z80 = function() {
     };
 
     this.reset = function() {
-        cycles = 0;
+        busCycles = 0;
         T = -1; opcode = null; ackINT = false;
         instruction = null; prefix = 0;
         PC = 0; I = 0; R = 0; IFF1 = 0; IM = 0;
@@ -63,9 +64,21 @@ wmsx.Z80 = function() {
         }
     };
 
-    this.getCycles = function() {
-        return cycles;
+    this.getBUSCycles = function() {
+        return busCycles;
     };
+
+    this.toggleTurboMode = function() {
+        turboClockShift = turboClockShift === 0 ? 1 : 0;
+    };
+
+    this.getTurboMode = function() {
+        return !!turboClockShift;
+    };
+
+
+    // Speed mode
+    var turboClockShift = WMSX.CPU_TURBO_MODE ? 1 : 0;
 
     // Extension Handling
     var extensionHandlers = [];
@@ -114,7 +127,7 @@ wmsx.Z80 = function() {
 
     // Fetch and Instruction control
 
-    var cycles = 0;
+    var busCycles = 0;
     var T = -1;                         // Clocks remaining in the current instruction
 
     var opcode;
@@ -161,15 +174,29 @@ wmsx.Z80 = function() {
 
     function selectInstruction() {
         if (prefix === 0) {
-            instruction = instructions[opcode];                           // always found
+            instruction = instructions[opcode];                                            // always found
         } else {
-            instruction = instructionsByPrefix[prefix][opcode];
-            if (!instruction) instruction = instructions[opcode];         // if nothing found, ignore prefix
+            instruction = instructionsByPrefix[prefix][opcode] || instructions[opcode];    // if nothing found, ignore prefix
             if (INT === 0 && IFF1) ackINT = true;
             prefix = 0;
         }
     }
 
+    function pcInc() {
+        var old = PC;
+        PC = (PC + 1) & 0xffff;
+        return old;
+    }
+
+    function spInc() {
+        var old = SP;
+        SP = (SP + 1) & 0xffff;
+        return old;
+    }
+
+    function decSP() {
+        return SP = (SP - 1) & 0xffff;
+    }
 
     function fromA() {
         return A;
@@ -314,62 +341,62 @@ wmsx.Z80 = function() {
 
     var preReadIXYdOffset = 0;
     function preReadIXYd() {
-        preReadIXYdOffset = bus.read(PC++);
+        preReadIXYdOffset = bus.read(pcInc());
     }
 
     function from_IXd_8() {
-        return bus.read(sum16Signed(IX, bus.read(PC++)));
+        return bus.read(sum16Signed(IX, bus.read(pcInc())));
     }
     from_IXd_8.fromPreReadAddr = function() {
         return bus.read(sum16Signed(IX, preReadIXYdOffset));
     };
 
     function from_IYd_8() {
-        return bus.read(sum16Signed(IY, bus.read(PC++)));
+        return bus.read(sum16Signed(IY, bus.read(pcInc())));
     }
     from_IYd_8.fromPreReadAddr = function() {
         return bus.read(sum16Signed(IY, preReadIXYdOffset));
     };
 
     function to_IXd_8(val) {
-        bus.write(sum16Signed(IX, bus.read(PC++)), val);
+        bus.write(sum16Signed(IX, bus.read(pcInc())), val);
     }
     to_IXd_8.toPreReadAddr = function(val) {
         bus.write(sum16Signed(IX, preReadIXYdOffset), val);
     };
 
     function to_IYd_8(val) {
-        bus.write(sum16Signed(IY, bus.read(PC++)), val);
+        bus.write(sum16Signed(IY, bus.read(pcInc())), val);
     }
     to_IYd_8.toPreReadAddr = function(val) {
         bus.write(sum16Signed(IY, preReadIXYdOffset), val);
     };
 
     function fromN() {
-        return bus.read(PC++);
+        return bus.read(pcInc());
     }
     function fromNN() {
-        return bus.read(PC++) | (bus.read(PC++) << 8);
+        return bus.read(pcInc()) | (bus.read(pcInc()) << 8);
     }
 
     function from_NN_8() {
-        return bus.read(bus.read(PC++) | (bus.read(PC++) << 8));
+        return bus.read(bus.read(pcInc()) | (bus.read(pcInc()) << 8));
     }
 
     function to_NN_8(val) {
-        var addr = bus.read(PC++) | (bus.read(PC++) << 8);
+        var addr = bus.read(pcInc()) | (bus.read(pcInc()) << 8);
         bus.write(addr, val);
     }
 
     function from_NN_16() {
-        var addr = bus.read(PC++) | (bus.read(PC++) << 8);
+        var addr = bus.read(pcInc()) | (bus.read(pcInc()) << 8);
         var low = bus.read(addr);
         addr = addr +  1; if (addr > 0xffff) addr = 0;
         return (bus.read(addr) << 8) | low;
     }
 
     function to_NN_16(val) {
-        var addr = bus.read(PC++) | (bus.read(PC++) << 8);
+        var addr = bus.read(pcInc()) | (bus.read(pcInc()) << 8);
         bus.write(addr, val & 255);
         addr = addr + 1; if (addr > 0xffff) addr = 0;
         bus.write(addr, val >>> 8);
@@ -380,12 +407,12 @@ wmsx.Z80 = function() {
     }
 
     function push16(val) {
-        bus.write(--SP, val >>> 8);
-        bus.write(--SP, val & 255);
+        bus.write(decSP(), val >>> 8);
+        bus.write(decSP(), val & 255);
     }
 
     function pop16() {
-        return bus.read(SP++) | (bus.read(SP++) << 8);
+        return bus.read(spInc()) | (bus.read(spInc()) << 8);
     }
 
     var parities = [    // 0b00000100 ready for P flag
@@ -406,7 +433,7 @@ wmsx.Z80 = function() {
     function HALT() {
         //Util.log("HALT!");
         //self.breakpoint("HALT");
-        PC = PC - 1;    // Keep repeating HALT instruction until an INT or RESET
+        --PC;    // Keep repeating HALT instruction until an INT or RESET
     }
 
     function newLD(to, from) {
@@ -425,7 +452,7 @@ wmsx.Z80 = function() {
     }
 
     function LDAR() {
-        A = R & 0xff;
+        A = R & 0x7f;
         // Flags
         F = (F & 0x01)                      // H = 0; N = 0; C = C
             | (A & 0xA8)                    // S = A is negative; f5, f3 copied from A
@@ -479,13 +506,13 @@ wmsx.Z80 = function() {
 
     function LDI() {
         to_DE_8(from_HL_8());
-        DE = DE + 1; if (DE > 0xffff) DE = 0;
-        HL = HL + 1; if (HL > 0xffff) HL = 0;
-        C = C - 1; if (C < 0) { C = 0xff; B = B - 1; if (B < 0) B = 0xff; }     // BC--
+        DE = (DE + 1) & 0xffff;
+        HL = (HL + 1) & 0xffff;
+        if (--C < 0) { C = 0xff; B = (B - 1) & 0xff; }     // BC--
         // Flags
         F = (F & 0xc1)                        // S = S; Z = Z; f5 = ?; H = 0; f3 = ?; N = 0; C = C;
             | ((B + C !== 0) << nPV);         // PV = BC != 0
-        // TODO Undocumented f5/f3 behavior for all LD block instructions, not implemented. Left 0
+        // Verify: Undocumented f5/f3 behavior for all LD block instructions, not implemented. Left 0
     }
 
     function LDIR() {
@@ -501,9 +528,9 @@ wmsx.Z80 = function() {
 
     function LDD() {
         to_DE_8(from_HL_8());
-        DE = DE - 1; if (DE < 0) DE = 0xffff;
-        HL = HL -1; if (HL < 0) HL = 0xffff;
-        C = C - 1; if (C < 0) { C = 0xff; B = B - 1; if (B < 0) B = 0xff; }     // BC--
+        DE = (DE - 1) & 0xffff;
+        HL = (HL - 1) & 0xffff;
+        if (--C < 0) { C = 0xff; B = (B - 1) & 0xff; }     // BC--
         // Flags
         F = (F & 0xc1)                      // S = S; Z = Z; f5 = ?; H = 0; f3 = ?; N = 0; C = C;
             | ((B + C !== 0) << nPV);       // PV = BC != 0
@@ -522,8 +549,8 @@ wmsx.Z80 = function() {
 
     function CPI() {
         var val = from_HL_8();
-        C = C - 1; if (C < 0) { C = 0xff; B = B - 1; if (B < 0) B = 0xff; }     // BC--
-        HL = HL + 1; if (HL > 0xffff) HL = 0;
+        if (--C < 0) { C = 0xff; B = (B - 1) & 0xff; }     // BC--
+        HL = (HL + 1) & 0xffff;
         // Flags
         var res = A - val;
         var compare = A ^ val ^ res;
@@ -547,8 +574,8 @@ wmsx.Z80 = function() {
 
     function CPD() {
         var val = from_HL_8();
-        C = C - 1; if (C < 0) { C = 0xff; B = B - 1; if (B < 0) B = 0xff; }     // BC--
-        HL = HL - 1; if (HL < 0) HL = 0xffff;
+        if (--C < 0) { C = 0xff; B = (B - 1) & 0xff; }     // BC--
+        HL = (HL - 1) & 0xffff;
         // Flags
         var res = A - val;
         var compare = A ^ val ^ res;
@@ -698,7 +725,7 @@ wmsx.Z80 = function() {
 
     function DJNZ() {
         var relat = fromN();
-        if (B === 0) B = 255; else B = B - 1;
+        B = (B - 1) & 0xff;
         if (B !== 0) {
             PC = sum16Signed(PC, relat);
             T += 5;
@@ -733,12 +760,12 @@ wmsx.Z80 = function() {
 
     function INI() {
         to_HL_8(bus.input(fromBC()));
-        HL = HL + 1; if (HL > 0xffff) HL = 0;
-        B = B - 1;  if (B < 0) B = 0xff;
+        HL = (HL + 1) & 0xffff;
+        B = (B - 1) & 0xff;
         // Flags
         F = (F & bC) | bN                          // S = ?; f5 = ?; H = ?; f3 = ?; PV = ?; N = 1; C = C
             | ((B === 0) << nZ);                   // Z = B is 0
-        // TODO Undocumented S/f5/H/f3/PV behavior for all IN/OUT block instructions, not implemented. Left 0
+        // Verify: Undocumented S/f5/H/f3/PV behavior for all IN/OUT block instructions, not implemented. Left 0
     }
 
     function INIR() {
@@ -754,8 +781,8 @@ wmsx.Z80 = function() {
 
     function IND() {
         to_HL_8(bus.input(fromBC()));
-        HL = HL - 1; if (HL < 0) HL = 0xffff;
-        B = B - 1;  if (B < 0) B = 0xff;
+        HL = (HL - 1) & 0xffff;
+        B = (B - 1) & 0xff;
         // Flags
         F = (F & bC) | bN                          // S = ?; f5 = ?; H = ?; f3 = ?; PV = ?; N = 1; C = C
             | ((B === 0) << nZ);                   // Z = B is 0
@@ -778,9 +805,9 @@ wmsx.Z80 = function() {
     }
 
     function OUTI() {
-        B = B - 1; if (B < 0) B = 0xff;
+        B = (B - 1) & 0xff;
         bus.output(fromBC(), from_HL_8());
-        HL = HL + 1; if (HL > 0xffff) HL = 0;
+        HL = (HL + 1) & 0xffff;
         // Flags
         F = (F & bC) | bN                          // S = ?; f5 = ?; H = ?; f3 = ?; PV = ?; N = 1; C = C
             | ((B === 0) << nZ);                   // Z = B is 0
@@ -798,9 +825,9 @@ wmsx.Z80 = function() {
     }
 
     function OUTD() {
-        B = B - 1; if (B < 0) B = 0xff;
+        B = (B - 1) & 0xff;
         bus.output(fromBC(), from_HL_8());
-        HL = HL - 1; if (HL < 0) HL = 0xffff;
+        HL = (HL - 1) & 0xffff;
         // Flags
         F = (F & bC) | bN                          // S = ?; f5 = ?; H = ?; f3 = ?; PV = ?; N = 1; C = C
             | ((B === 0) << nZ);                   // Z = B is 0
@@ -1202,7 +1229,7 @@ wmsx.Z80 = function() {
             } else {
                 F = (F & bC) | 0x54;                   // S = 0, Z = 1; f5 = 0; H = 1; f3 = 0; P = 1; N = 0; C = C
             }
-            // TODO Undocumented f5/f3 behavior when (HL/IX/IY) used, not implemented. Left 0
+            // Verify: Undocumented f5/f3 behavior when (HL/IX/IY) used, not implemented. Left 0
         }
     }
 
@@ -1319,7 +1346,7 @@ wmsx.Z80 = function() {
     function pINT() {
         IFF1 = 0;
         ackINT = false;
-        if (instruction === instructionHALT) PC = PC + 1;     // To "escape" from the HALT, and continue in the next instruction after RET
+        if (instruction === instructionHALT) pcInc();     // To "escape" from the HALT, and continue in the next instruction after RET
         push16(PC);
         instruction = instructionADT_CYCLES;
         if (IM === 1) {
@@ -2576,7 +2603,7 @@ wmsx.Z80 = function() {
             else if (instr.prefix === 0xfd)   instructionsFD[instr.opcode] = instr;
             else throw new Error("Invalid instruction prefix!");
         }
-    };
+    }
 
     // Savestate  -------------------------------------------
 
@@ -2584,16 +2611,18 @@ wmsx.Z80 = function() {
         return {
             PC: PC, SP: SP, A: A, F: F, B: B, C: C, DE: DE, HL: HL, IX: IX, IY: IY,
             AF2: AF2, BC2: BC2, DE2: DE2, HL2: HL2, I: I, R: R, IM: IM, IFF1: IFF1, INT: INT,
-            T: T, o: opcode, p: prefix, ai: ackINT, ii: this.instructionsAll.indexOf(instruction),
-            ecr: extensionCurrentlyRunning, eei: extensionExtraIterations
+            c: busCycles, T: T, o: opcode, p: prefix, ai: ackINT, ii: this.instructionsAll.indexOf(instruction),
+            ecr: extensionCurrentlyRunning, eei: extensionExtraIterations,
+            tcs: turboClockShift
         };
     };
 
     this.loadState = function(s) {
         PC = s.PC; SP = s.SP; A = s.A; F = s.F; B = s.B; C = s.C; DE = s.DE; HL = s.HL; IX = s.IX; IY = s.IY;
         AF2 = s.AF2; BC2 = s.BC2; DE2 = s.DE2; HL2 = s.HL2; I = s.I; R = s.R; IM = s.IM; IFF1 = s.IFF1; this.setINT(s.INT);
-        T = s.T; opcode = s.o; prefix = s.p; ackINT = s.ai; instruction = this.instructionsAll[s.ii] || null;
-        extensionCurrentlyRunning  = s.ecr; extensionExtraIterations = s.eei;
+        busCycles = s.c; T = s.T; opcode = s.o; prefix = s.p; ackINT = s.ai; instruction = this.instructionsAll[s.ii] || null;
+        extensionCurrentlyRunning = s.ecr; extensionExtraIterations = s.eei;
+        turboClockShift = s.tcs || 0;
     };
 
 
@@ -2601,7 +2630,7 @@ wmsx.Z80 = function() {
 
     this.toString = function() {
         return "CPU " +
-            " PC: " + wmsx.Util.toHex2(PC) + "      op: " + (instruction ? instruction.mnemonic : "NULL") + "          cycle: " + cycles + "\n\n" +
+            " PC: " + wmsx.Util.toHex2(PC) + "      op: " + (instruction ? instruction.mnemonic : "NULL") + "          cycle: " + busCycles + "\n\n" +
             "A: " + wmsx.Util.toHex2(A) + "     B: " + wmsx.Util.toHex2(B) + "     C: " + wmsx.Util.toHex2(C) + "     D: " + wmsx.Util.toHex2(DE >>> 8) +
             "     E: " + wmsx.Util.toHex2(DE & 0xff) + "     H: " + wmsx.Util.toHex2(HL >>> 8) + "     L: " + wmsx.Util.toHex2(HL & 0xff) + "\n" +
             "BC: " + wmsx.Util.toHex2(fromBC()) + "  DE: " + wmsx.Util.toHex2(DE) + "  HL: " + wmsx.Util.toHex2(HL) +
@@ -2663,3 +2692,5 @@ wmsx.Z80 = function() {
     init();
 
 };
+
+wmsx.Z80.BASE_CLOCK = 3584160;      // MHz

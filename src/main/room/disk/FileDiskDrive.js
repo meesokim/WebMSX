@@ -1,12 +1,21 @@
 // Copyright 2015 by Paulo Augusto Peccin. See license.txt distributed with this file.
 
 // Dual Disk Drive ( A: = drive 0, B: = drive 1 )
+
 wmsx.FileDiskDrive = function() {
+"use strict";
+
     var self = this;
+
+    function init() {
+        emptyStack(0);
+        emptyStack(1);
+    }
 
     this.connect = function(pDiskDriveSocket) {
         diskDriveSocket = pDiskDriveSocket;
         diskDriveSocket.connectDrive(this);
+        images.connect(diskDriveSocket);
     };
 
     this.connectPeripherals = function(pScreen, pDownloader) {
@@ -14,125 +23,256 @@ wmsx.FileDiskDrive = function() {
         fileDownloader = pDownloader;
     };
 
-    this.loadDiskFile = function(drive, name, arrContent, altPower) {
-        if ((arrContent[0] !== 0xEB) && (arrContent[0] !== 0xE9))
-            return null;
+    this.loadDiskStackFromFiles = function (drive, files, altPower, addToStack, filesFromZip) {
+        if (addToStack && maxStackReachedMessage(drive)) return [];
 
-        diskFileName[drive] = name;
-        diskContent[drive] = arrContent.slice(0);
-        diskChanged[drive] = true;
-        screen.showOSD("Disk " + (drive === 0 ? "A:" : "B:") + " loaded", true);
-        fireStateUpdate();
-
-        diskDriveSocket.autoPowerCycle(altPower);
-
-        return diskContent[drive];
+        var stack = [];
+        var maxStack = addToStack ? MAX_STACK - driveStack[drive].length : MAX_STACK;
+        try {
+            for (var i = 0; i < files.length && stack.length < maxStack; i++) {
+                var file = files[i];
+                if (filesFromZip && file.content === undefined) file.content = file.asUint8Array();
+                var disk = checkFileIsValidImage(file);
+                if (disk) stack.push(disk);
+            }
+            if (stack.length > 0) {
+                loadStack(drive, stack, altPower, addToStack);
+                stackLoadedMessage(drive, null, stack.length, addToStack);
+                return stack;
+            }
+        } catch(ez) {
+            wmsx.Util.error(ez);      // Error decompressing files. Abort
+        }
+        return null;
     };
 
-    this.loadEmptyDisk = function(drive) {      // Formatted
-        if (++(nextNewDiskFormat[drive]) >= FORMAT_OPTION_DESC.length) (nextNewDiskFormat[drive]) = 0;      // Cycle available formats
-        var format = nextNewDiskFormat[drive];
-        this.createNewEmptyDisk(drive, format);
-        this.formatDisk(drive, format);
-        screen.showOSD("New formatted " + FORMAT_OPTION_DESC[format] + " disk loaded in " + (drive === 0 ? "A:" : "B:"), true);
-        return diskContent[drive];
+    this.loadAsDiskFromFiles = function (drive, name, files, altPower, addToStack, type) {
+        var content = images.createFromFiles(0xF9, files);
+        if (!content) return null;
+        if (addToStack && maxStackReachedMessage(drive)) return [];
+
+        type = type || "Files as Disk";
+        name = name || ("New " + type + ".dsk");
+        var stack = [{ name: name, content: content }];
+        loadStack(drive, stack, altPower, addToStack);
+        stackLoadedMessage(drive, type, stack.length, addToStack);
+        return stack;
     };
 
-    this.createNewEmptyDisk = function(drive, format) {
-        diskFileName[drive] = "NewDisk" + FORMAT_OPTION_DESC[format] + ".dsk";
-        diskContent[drive] = wmsx.Util.arrayFill(new Array(FORMAT_OPTION_SIZE[format]), 0);
-        diskChanged[drive] = true;
-        fireStateUpdate();
-        screen.showOSD("New empty " + FORMAT_OPTION_DESC[format] + " disk loaded in " + (drive === 0 ? "A:" : "B:"), true);
-        return diskContent[drive];
+    this.insertNewDisk = function(drive, mediaType, unformatted) {     // Cycle among format options if no mediaType given
+        if (!mediaType) {
+            if (++(nextNewDiskFormatOption[drive]) >= this.FORMAT_OPTIONS_MEDIA_TYPES.length) nextNewDiskFormatOption[drive] = 0;
+            mediaType = this.FORMAT_OPTIONS_MEDIA_TYPES[nextNewDiskFormatOption[drive]];
+        }
+        var fileName = "New " + this.MEDIA_TYPE_INFO[mediaType].desc + " Disk.dsk";
+        var content = unformatted ? images.createNewBlankDisk(mediaType) : images.createNewFormattedDisk(mediaType);
+
+        // Add a new disk to the stack?
+        var add = driveStack[drive].length === 0 || !driveBlankDiskAdded[drive];    // Only add 1 disk to loaded stacks, always to the bottom
+        if (add) driveStack[drive].push({});
+
+        curDisk[drive] = driveStack[drive].length - 1;
+        replaceCurrentDisk(drive, fileName, content);
+        driveBlankDiskAdded[drive] = true;
+
+        add = add && driveStack[drive].length > 1;
+        screen.showOSD((add ? "New " : "") + "Blank" + (!unformatted ? " Formatted" : "") + " Disk " + (add ? "added. " : "inserted. ") + currentDiskDesc(drive), true);
+
+        if (add) self.openDiskSelectDialog(drive, 0, true);
     };
 
-    this.removeDisk = function(drive) {
-        diskFileName[drive] = null;
-        diskContent[drive] = null;
-        diskChanged[drive] = null;
-        screen.showOSD("Disk " + (drive === 0 ? "A:" : "B:") + " removed", true);
-        fireStateUpdate();
+    this.removeStack = function(drive) {
+        if (noDiskInsertedMessage(drive)) return;
+
+        var wasStack = driveStack[drive].length > 1;
+        emptyStack(drive);
+        driveDiskChanged[drive] = null;
+
+        screen.showOSD((wasStack ? "Disk Stack in Drive " : "Disk ") + driveName[drive] + " removed", true);
+        fireMediaStateUpdate(drive);
     };
 
     this.saveDiskFile = function(drive) {
-        var dContent = diskContent[drive];
-        var dName = (drive === 0 ? "A:" : "B:");
-        if (!dContent || (dContent.length === 0)) {
-            screen.showOSD("Drive " + dName + " is empty!", true);
-            return;
-        }
+        if (noDiskInsertedMessage(drive)) return;
 
         try {
-            var fileName = diskFileName[drive] || "NewDisk.dsk";
-            var data = new ArrayBuffer(dContent.length);
-            var view = new Uint8Array(data);
-            for (var i = 0; i < dContent.length; i++)
-                view[i] = dContent[i];
-            fileDownloader.startDownload(fileName, data);
-            screen.showOSD("Disk " + dName + " File saved", true);
+            fileDownloader.startDownloadBinary(makeFileNameToSave(getCurrentDisk(drive).name), new Uint8Array(getCurrentDisk(drive).content), "Disk " + driveName[drive] + " file");
         } catch(ex) {
-            screen.showOSD("Disk " + dName + " File save failed", true);
+            // give up
         }
     };
+
+    this.autoPowerCycle = function(altPower) {
+        if (getCurrentDisk(0)) diskDriveSocket.autoPowerCycle(altPower);       // Only if Drive A: has a disk
+    };
+
+    this.openDiskSelectDialog = function(drive, inc, altPower) {
+        if (noDiskInsertedMessage(drive)) return;
+        screen.openDiskSelectDialog(drive, inc, altPower);
+    };
+
+    this.insertDisk = function(drive, num) {
+        setCurrentDiskNum(drive, num);
+        diskInsertedMessage(drive);
+        fireMediaStateUpdate(drive);
+    };
+
+    this.getDriveStack = function(drive) {
+        return driveStack[drive];
+    };
+
+    this.getCurrentDiskNum = function(drive) {
+        return curDisk[drive];
+    };
+
+    this.getCurrentDiskDesc = function(drive) {
+        return currentDiskDesc(drive);
+    };
+
+    this.getCurrentDiskNumDesc = function(drive) {
+        return currentDiskNumDesc(drive);
+    };
+
+    this.moveDiskInStack = function (drive, from, to) {
+        var stack = driveStack[drive];
+        if (from < 0 || to < 0 || from > stack.length -1 || to > stack.length -1) return;
+        var disk = stack[curDisk[drive]];
+        stack.splice(to, 0, stack.splice(from, 1)[0]);
+        if (disk) curDisk[drive] = stack.indexOf(disk);
+        fireMediaStateUpdate(drive);
+    };
+
+    function checkFileIsValidImage(file, stopRecursion) {
+        if (checkContentIsValidImage(file.content))
+            return { name: file.name.split("/").pop(), content: wmsx.Util.asNormalArray(file.content) };
+
+        if (!stopRecursion) {
+            var zip = wmsx.Util.checkContentIsZIP(file.content);
+            if (zip) {
+                try {
+                    var files = wmsx.Util.getZIPFilesSorted(zip);
+                    for (var f in files) {
+                        files[f].content = files[f].asUint8Array();
+                        var res = checkFileIsValidImage(files[f], true);
+                        if (res) return res;
+                    }
+                } catch (ez) {
+                    wmsx.Util.error(ez);      // Error decompressing files. Abort
+                }
+                return null;
+            }
+        }
+
+        var gzip = wmsx.Util.checkContentIsGZIP(file.content);
+        if (gzip) return checkFileIsValidImage({ name: file.name, content: gzip }, true);
+
+        return null;
+    }
+
+    function checkContentIsValidImage(content) {
+        return self.MEDIA_TYPE_VALID_SIZES.has(content.length) ? content : null;            // Valid image size
+        //(anyContent || content[0] === 0xe9 || content[0] === 0xeb);                       // Valid boot sector?
+    }
+
+    function emptyStack(drive) {
+        driveStack[drive].length = 0;
+        curDisk[drive] = -1;
+    }
+
+    function loadStack(drive, stack, altPower, add) {
+        if (add) {
+            driveStack[drive] = driveStack[drive].concat(stack);
+            if (!getCurrentDisk(drive)) setCurrentDiskNum(drive, 0);
+        } else {
+            driveStack[drive] = stack;
+            driveBlankDiskAdded[drive] = false;
+            setCurrentDiskNum(drive, 0);
+        }
+        fireMediaStateUpdate(drive);
+        if (driveStack[drive].length > 1 && !altPower) self.openDiskSelectDialog(drive, 0, altPower);
+        else self.autoPowerCycle(altPower);
+    }
+
+    function replaceCurrentDisk(drive, name, content) {     // Affects only current disk from stack
+        getCurrentDisk(drive).name = name;
+        getCurrentDisk(drive).content = content;
+        driveDiskChanged[drive] = true;
+        fireMediaStateUpdate(drive);
+        return content;
+    }
+
+    function makeFileNameToSave(fileName) {
+        if (!fileName) return "New Disk.dsk";
+
+        return wmsx.Util.leafFilenameNoExtension(fileName) + ".dsk";
+    }
 
     // DiskDriver interface methods
 
     this.diskHasChanged = function(drive) {
-        if (diskChanged[drive]) {
-            diskChanged[drive] = false;
+        if (driveDiskChanged[drive]) {
+            driveDiskChanged[drive] = false;
             return true;
         }
-        return diskChanged[drive];         // false = no, null = unknowm
+        return driveDiskChanged[drive];         // false = no, null = unknown
     };
 
-    this.diskPresent = function(drive) {
-        return !!(diskContent[drive] && diskContent[drive].length);
+    this.isDiskInserted = function(drive) {
+        return !!getCurrentDisk(drive);
     };
 
     this.diskWriteProtected = function(drive) {
         return false;
     };
 
-    this.readSectors = function(drive, logicalSector, quantSectors) {
-        if (!this.diskPresent(drive)) return null;
-        var dContent = diskContent[drive];
-        var startByte = logicalSector * BYTES_PER_SECTOR;
-        var finishByte = startByte + quantSectors * BYTES_PER_SECTOR;
+    this.readByte = function(drive, position) {
+        if (!this.isDiskInserted(drive)) return null;
+        var dContent = getCurrentDisk(drive).content;
         // Disk boundary check
-        if ((startByte >= dContent.length) || (finishByte > dContent.length)) return null;
-
-        return dContent.slice(startByte, finishByte);
+        return position >= dContent.length ? null : dContent[position];
     };
 
-    this.writeSectors = function(drive, logicalSector, quantSectors, bytes) {
-        return this.writeBytes(drive, bytes, logicalSector * BYTES_PER_SECTOR, quantSectors * BYTES_PER_SECTOR);
-    };
-
-    this.writeBytes = function (drive, bytes, startByte, quantBytes) {
-        if (!this.diskPresent(drive)) return false;
-
-        var dContent = diskContent[drive];
-        if (!quantBytes) quantBytes = bytes.length;
+    this.readSectorsToSlot = function(drive, logicalSector, quantSectors, slot, address) {
+        if (!this.isDiskInserted(drive)) return false;
+        var dContent = getCurrentDisk(drive).content;
+        var startByte = logicalSector * BYTES_PER_SECTOR;
+        var quantBytes = quantSectors * BYTES_PER_SECTOR;
 
         // Disk boundary check
         if ((startByte >= dContent.length) || (startByte + quantBytes > dContent.length)) return false;
 
+        // Transfer
         for (var i = 0; i < quantBytes; i++)
-            dContent[startByte + i] = bytes[i];
+           slot.write(address + i, dContent[startByte + i]);
+
+        return true;
+    };
+
+    this.writeSectorsFromSlot = function(drive, logicalSector, quantSectors, slot, address) {
+        if (!this.isDiskInserted(drive)) return false;
+        var dContent = getCurrentDisk(drive).content;
+        var startByte =  logicalSector * BYTES_PER_SECTOR;
+        var quantBytes = quantSectors * BYTES_PER_SECTOR;
+
+        // Disk boundary check
+        if ((startByte >= dContent.length) || (startByte + quantBytes > dContent.length)) return false;
+
+        // Transfer
+        for (var i = 0; i < quantBytes; i++)
+            dContent[startByte + i] = slot.read(address + i);
 
         return true;
     };
 
     // Returns the extra time for motor to spin (drive LED simulation)
     this.motorOn = function(drive) {
-        if (diskMotorOffTimer[drive]) {
-            window.clearTimeout(diskMotorOffTimer[drive]);
-            diskMotorOffTimer[drive] = null;
+        if (driveMotorOffTimer[drive]) {
+            clearTimeout(driveMotorOffTimer[drive]);
+            driveMotorOffTimer[drive] = null;
         }
-        if (diskMotor[drive]) return 0;
-        diskMotor[drive] = true;
-        fireStateUpdate();
+        if (driveMotor[drive]) return 0;
+        driveMotor[drive] = true;
+        fireMotorStateUpdate();
         return MOTOR_SPINUP_EXTRA_ITERATIONS;
     };
 
@@ -142,56 +282,112 @@ wmsx.FileDiskDrive = function() {
     };
 
     this.allMotorsOffNow = function() {                 // Instantly with no delays
-        diskMotor[0] = diskMotor[1] = false;
-        fireStateUpdate();
+        driveMotor[0] = driveMotor[1] = false;
+        fireMotorStateUpdate();
     };
 
-    this.formatDisk = function(drive, format) {
-        // Write Boot Sector
-        self.writeBytes(drive, FORMAT_OPTION_BOOT_SECTOR[format], 0);
-        // Write starting bytes of FAT
-        self.writeBytes(drive, FORMAT_OPTION_FAT_START[format], 1 * BYTES_PER_SECTOR);
+    this.formatCurrentDisk = function(drive, mediaType) {
+        return images.formatDisk(mediaType, getCurrentDisk(drive).content);
     };
 
     // Add a delay before turning the motor off (drive LED simulation)
     function motorOff(drive, resetDelay) {
-        if (!diskMotor[drive]) return;
-        if (diskMotorOffTimer[drive] && resetDelay) {
-            window.clearTimeout(diskMotorOffTimer[drive]);
-            diskMotorOffTimer[drive] = null;
+        if (!driveMotor[drive]) return;
+        if (driveMotorOffTimer[drive] && resetDelay) {
+            clearTimeout(driveMotorOffTimer[drive]);
+            driveMotorOffTimer[drive] = null;
         }
-        if (!diskMotorOffTimer[drive])
-            diskMotorOffTimer[drive] = window.setTimeout(function() {
-                diskMotorOffTimer[drive] = null;
-                diskMotor[drive] = false;
-                fireStateUpdate();
+        if (!driveMotorOffTimer[drive])
+            driveMotorOffTimer[drive] = setTimeout(function() {
+                driveMotorOffTimer[drive] = null;
+                driveMotor[drive] = false;
+                fireMotorStateUpdate();
             }, MOTOR_SPINDOWN_EXTRA_MILLIS);
     }
 
-    function fireStateUpdate() {
-        screen.diskDrivesStateUpdate(self.diskPresent(0), diskMotor[0], self.diskPresent(1), diskMotor[1]);
+    function setCurrentDiskNum(drive, num) {
+        curDisk[drive] = num;
+        driveDiskChanged[drive] = true;
+    }
+
+    function getCurrentDisk(drive) {
+        return driveStack[drive][curDisk[drive]];
+    }
+
+    function fireMediaStateUpdate(drive) {
+        screen.diskDrivesMediaStateUpdate(drive);
+        fireMotorStateUpdate();
+    }
+
+    function fireMotorStateUpdate() {
+        screen.diskDrivesMotorStateUpdate(getCurrentDisk(0), driveMotor[0], getCurrentDisk(1), driveMotor[1]);
+    }
+
+    function noDiskInsertedMessage(drive) {
+        if (!self.isDiskInserted(drive)) {
+            screen.showOSD("No Disk in Drive " + driveName[drive], true, true);
+            return true;
+        } else
+            return false;
+    }
+
+    function maxStackReachedMessage(drive) {
+        if (driveStack[drive].length >= MAX_STACK) {
+            screen.showOSD("Maximum Stack size in Drive " + driveName[drive] + " (" + driveStack[drive].length + " disks)", true, true);
+            return true;
+        } else
+            return false;
+    }
+
+    function stackLoadedMessage(drive, type, quant, added) {
+        type = type || "Disk";
+        var mes = added ? "" + quant + " " + type + (quant > 1 ? "s" : "") + " added to Drive " + driveName[drive]
+            : quant > 1 ? "" + quant + " Disks loaded in Drive " + driveName[drive]
+            : currentDiskDesc(drive);
+        screen.showOSD(mes, true);
+    }
+
+    function diskInsertedMessage(drive) {
+        if (noDiskInsertedMessage(drive)) return;
+        screen.showOSD(currentDiskDesc(drive), true);
+    }
+
+    function currentDiskDesc(drive) {
+        var disk = getCurrentDisk(drive);
+        return [ "Disk " + driveName[drive], currentDiskNumDesc(drive), disk && disk.name].join(" ");
+    }
+
+    function currentDiskNumDesc(drive) {
+        return driveStack[drive].length > 1 ? "(" + (curDisk[drive] + 1) + "/" + driveStack[drive].length + ") " : "";
     }
 
 
     // Savestate  -------------------------------------------
 
     this.saveState = function() {
+        var stack = [[], []];
+        for (var d = 0; d < driveStack[0].length; ++d) stack[0].push( { name: driveStack[0][d].name, content: wmsx.Util.compressInt8BitArrayToStringBase64(driveStack[0][d].content) });
+        for (    d = 0; d < driveStack[1].length; ++d) stack[1].push( { name: driveStack[1][d].name, content: wmsx.Util.compressInt8BitArrayToStringBase64(driveStack[1][d].content) });
         return {
-            f: diskFileName,
-            c: [ wmsx.Util.compressUInt8ArrayToStringBase64(diskContent[0]),
-                 wmsx.Util.compressUInt8ArrayToStringBase64(diskContent[1]) ],
-            g: diskChanged,
-            m: diskMotor
+            s: stack,
+            c: curDisk,
+            b: driveBlankDiskAdded,
+            g: driveDiskChanged,
+            m: driveMotor
         };
     };
 
     this.loadState = function(state) {
-        diskFileName = state.f;
-        diskContent = [ wmsx.Util.uncompressStringBase64ToUInt8Array(state.c[0]),
-                        wmsx.Util.uncompressStringBase64ToUInt8Array(state.c[1]) ];
-        diskChanged = state.g;
-        diskMotor = state.m;
-        fireStateUpdate();
+        var oldStack = driveStack;
+        driveStack[0].length = driveStack[1].length = 0;
+        var stack = state.s;
+        for (var d = 0; d < stack[0].length; ++d) driveStack[0].push( { name: stack[0][d].name, content: wmsx.Util.uncompressStringBase64ToInt8BitArray(stack[0][d].content, oldStack[0][d] && oldStack[0][d].content) });
+        for (    d = 0; d < stack[1].length; ++d) driveStack[1].push( { name: stack[1][d].name, content: wmsx.Util.uncompressStringBase64ToInt8BitArray(stack[1][d].content, oldStack[1][d] && oldStack[1][d].content) });
+        curDisk = state.c;
+        driveBlankDiskAdded = state.b;
+        driveDiskChanged = state.g;
+        driveMotor = state.m;
+        fireMediaStateUpdate(0); fireMediaStateUpdate(1);
         this.allMotorsOff(true);
     };
 
@@ -200,57 +396,39 @@ wmsx.FileDiskDrive = function() {
         return eval(str);
     };
 
+    var images = new wmsx.DiskImages();
 
     var screen;
     var fileDownloader;
     var diskDriveSocket;
 
-    var diskFileName = [ null, null ];
-    var diskContent =  [ null, null ];
-    var diskChanged =  [ null, null ];            // true = yes, false = no, null = unknown
-    var diskMotor =    [ false, false ];
+    var driveStack   = [[], []];                    // Several disks can be loaded for each drive
+    var curDisk      = [0, 0];                      // Current disk from stack inserted in drive
 
-    var diskMotorOffTimer = [ null, null ];
+    var driveBlankDiskAdded = [ false, false ];
 
-    var nextNewDiskFormat = [ 0, 0 ];
+    var driveDiskChanged    = [ null, null ];         // true = yes, false = no, null = unknown
+    var driveMotor          = [ false, false ];
+    var driveMotorOffTimer  = [ null, null ];
 
-    var BYTES_PER_SECTOR = 512;                   // Fixed for now, for all disks
+    var driveName = [ "A:", "B:" ];
+    var nextNewDiskFormatOption = [ -1, -1 ];
 
-    var MOTOR_SPINUP_EXTRA_ITERATIONS = 280000;
+    var BYTES_PER_SECTOR = 512;                     // Fixed for now, for all disks
+
+    var MOTOR_SPINUP_EXTRA_ITERATIONS = 100000;
     var MOTOR_SPINDOWN_EXTRA_MILLIS = 2300;
 
-    var FORMAT_OPTION_DESC = [ "360KB", "720KB" ];
-    var FORMAT_OPTION_SIZE = [ 360 * 1024, 720 * 1024 ];
-    var FORMAT_OPTION_BOOT_SECTOR = [
-        [
-            0xEB, 0xFE, 0x90, 0x4E, 0x4D, 0x53, 0x20, 0x32, 0x2E, 0x30, 0x50, 0x00, 0x02, 0x02, 0x01, 0x00,
-            0x02, 0x70, 0x00, 0xD0, 0x02, 0xF8, 0x02, 0x00, 0x09, 0x00, 0x01, 0x00, 0x00, 0x00, 0xD0, 0xED,
-            0x53, 0x59, 0xC0, 0x32, 0xD0, 0xC0, 0x36, 0x56, 0x23, 0x36, 0xC0, 0x31, 0x1F, 0xF5, 0x11, 0xAB,
-            0xC0, 0x0E, 0x0F, 0xCD, 0x7D, 0xF3, 0x3C, 0xCA, 0x63, 0xC0, 0x11, 0x00, 0x01, 0x0E, 0x1A, 0xCD,
-            0x7D, 0xF3, 0x21, 0x01, 0x00, 0x22, 0xB9, 0xC0, 0x21, 0x00, 0x3F, 0x11, 0xAB, 0xC0, 0x0E, 0x27,
-            0xCD, 0x7D, 0xF3, 0xC3, 0x00, 0x01, 0x58, 0xC0, 0xCD, 0x00, 0x00, 0x79, 0xE6, 0xFE, 0xFE, 0x02,
-            0xC2, 0x6A, 0xC0, 0x3A, 0xD0, 0xC0, 0xA7, 0xCA, 0x22, 0x40, 0x11, 0x85, 0xC0, 0xCD, 0x77, 0xC0,
-            0x0E, 0x07, 0xCD, 0x7D, 0xF3, 0x18, 0xB4, 0x1A, 0xB7, 0xC8, 0xD5, 0x5F, 0x0E, 0x06, 0xCD, 0x7D,
-            0xF3, 0xD1, 0x13, 0x18, 0xF2, 0x42, 0x6F, 0x6F, 0x74, 0x20, 0x65, 0x72, 0x72, 0x6F, 0x72, 0x0D,
-            0x0A, 0x50, 0x72, 0x65, 0x73, 0x73, 0x20, 0x61, 0x6E, 0x79, 0x20, 0x6B, 0x65, 0x79, 0x20, 0x66,
-            0x6F, 0x72, 0x20, 0x72, 0x65, 0x74, 0x72, 0x79, 0x0D, 0x0A, 0x00, 0x00, 0x4D, 0x53, 0x58, 0x44,
-            0x4F, 0x53, 0x20, 0x20, 0x53, 0x59, 0x53, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-        ],
-        [
-            0xEB, 0xFE, 0x90, 0x4E, 0x4D, 0x53, 0x20, 0x32, 0x2E, 0x30, 0x50, 0x00, 0x02, 0x02, 0x01, 0x00,
-            0x02, 0x70, 0x00, 0xA0, 0x05, 0xF9, 0x03, 0x00, 0x09, 0x00, 0x02, 0x00, 0x00, 0x00, 0xD0, 0xED,
-            0x53, 0x59, 0xC0, 0x32, 0xD0, 0xC0, 0x36, 0x56, 0x23, 0x36, 0xC0, 0x31, 0x1F, 0xF5, 0x11, 0xAB,
-            0xC0, 0x0E, 0x0F, 0xCD, 0x7D, 0xF3, 0x3C, 0xCA, 0x63, 0xC0, 0x11, 0x00, 0x01, 0x0E, 0x1A, 0xCD,
-            0x7D, 0xF3, 0x21, 0x01, 0x00, 0x22, 0xB9, 0xC0, 0x21, 0x00, 0x3F, 0x11, 0xAB, 0xC0, 0x0E, 0x27,
-            0xCD, 0x7D, 0xF3, 0xC3, 0x00, 0x01, 0x58, 0xC0, 0xCD, 0x00, 0x00, 0x79, 0xE6, 0xFE, 0xFE, 0x02,
-            0xC2, 0x6A, 0xC0, 0x3A, 0xD0, 0xC0, 0xA7, 0xCA, 0x22, 0x40, 0x11, 0x85, 0xC0, 0xCD, 0x77, 0xC0,
-            0x0E, 0x07, 0xCD, 0x7D, 0xF3, 0x18, 0xB4, 0x1A, 0xB7, 0xC8, 0xD5, 0x5F, 0x0E, 0x06, 0xCD, 0x7D,
-            0xF3, 0xD1, 0x13, 0x18, 0xF2, 0x42, 0x6F, 0x6F, 0x74, 0x20, 0x65, 0x72, 0x72, 0x6F, 0x72, 0x0D,
-            0x0A, 0x50, 0x72, 0x65, 0x73, 0x73, 0x20, 0x61, 0x6E, 0x79, 0x20, 0x6B, 0x65, 0x79, 0x20, 0x66,
-            0x6F, 0x72, 0x20, 0x72, 0x65, 0x74, 0x72, 0x79, 0x0D, 0x0A, 0x00, 0x00, 0x4D, 0x53, 0x58, 0x44,
-            0x4F, 0x53, 0x20, 0x20, 0x53, 0x59, 0x53, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-        ]
-    ];
-    var FORMAT_OPTION_FAT_START = [ [ 0xF8, 0xFF, 0xFF ], [ 0xF9, 0xFF, 0xFF ] ];
+    var MAX_STACK = wmsx.FileDiskDrive.MAX_STACK;
+
+    this.FORMAT_OPTIONS_MEDIA_TYPES = images.FORMAT_OPTIONS_MEDIA_TYPES;
+    this.MEDIA_TYPE_INFO = images.MEDIA_TYPE_INFO;
+    this.MEDIA_TYPE_VALID_SIZES = images.MEDIA_TYPE_VALID_SIZES;
+    this.MEDIA_TYPE_DPB = images.MEDIA_TYPE_DPB;
+
+
+    init();
 
 };
+
+wmsx.FileDiskDrive.MAX_STACK = 10;

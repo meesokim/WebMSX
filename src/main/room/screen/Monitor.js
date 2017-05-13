@@ -1,154 +1,103 @@
 // Copyright 2015 by Paulo Augusto Peccin. See license.txt distributed with this file.
 
 wmsx.Monitor = function(display) {
+"use strict";
 
-    function init(self) {
-        self.setDefaults();
-    }
-
-    this.connect = function(pVideoSignal, pCartridgeSocket) {
-        cartridgeSocket = pCartridgeSocket;
-        cartridgeSocket.addCartridgesStateListener(this);
+    this.connect = function(pVideoSignal) {
         videoSignal = pVideoSignal;
         videoSignal.connectMonitor(this);
     };
 
-    this.setSignalMetrics = function(metrics) {
-        display.setSignalMetrics(metrics);
-    };
-
-    this.newFrame = function(image, sourceX, sourceY, sourceWidth, sourceHeight) {
-        display.refresh(image, sourceX, sourceY, sourceWidth, sourceHeight);
+    this.newFrame = function(image, sourceWidth, sourceHeight) {
+        display.refresh(image, sourceWidth, sourceHeight);
     };
 
     this.signalOff = function() {
         display.videoSignalOff();
     };
 
-    this.showOSD = function(message, overlap) {
-        display.showOSD(message, overlap);
+    this.showOSD = function(message, overlap, error) {
+        display.showOSD(message, overlap, error);
     };
 
-    this.cartridgesStateUpdate = function(cartridge1, cartridge2) {
-        crtSetModeForCartridges(cartridge1, cartridge2);
+    this.setDisplayMetrics = function(targetWidth, targetHeight) {
+        display.displayMetrics(targetWidth, targetHeight);
     };
 
-    this.setDisplayDefaultSize = function() {
-        if (display != null) {
-            var scX = display.displayDefaultOpeningScaleX();
-            setDisplayScale(scX, scX / wmsx.Monitor.DEFAULT_SCALE_ASPECT_X);
-        } else
-            setDisplayScale(WMSX.SCREEN_DEFAULT_SCALE, WMSX.SCREEN_DEFAULT_SCALE);
-        displayCenter();
+    this.setPixelMetrics = function(pixelWidth, pixelHeight) {
+        display.displayPixelMetrics(pixelWidth, pixelHeight);
     };
 
     this.setDefaults = function() {
-        this.setDisplayDefaultSize();
-        crtModeSetDefault();
+        display.crtModeSetDefault();
         display.crtFilterSetDefault();
+        display.requestReadjust(true);
+    };
+
+    this.setDebugMode = function(boo) {
+        display.setDebugMode(boo);
     };
 
     this.crtModeToggle = function() {
-        display.showOSD("CRT modes not available yet!", true);
-        //setCrtMode(crtMode + 1);
-        //display.showOSD("CRT mode: " + CRT_MODE_NAMES[crtMode], true);
+        display.crtModeToggle();
     };
 
     this.crtFilterToggle = function() {
         display.crtFilterToggle();
     };
 
-    this.debugModesCycle = function() {
-        debug++;
-        if (debug > 4) debug = 0;
-    };
-
     this.fullscreenToggle = function() {
         display.displayToggleFullscreen();
     };
 
-    this.displayScaleXDecrease = function() {
-        setDisplayScale(displayScaleX - wmsx.Monitor.SCALE_STEP, displayScaleY);
+    this.displayAspectDecrease = function() {
+        this.displayScale(normalizeAspectX(displayAspectX - wmsx.Monitor.SCALE_STEP), displayScaleY);
+        this.showOSD("Display Aspect: " + displayAspectX.toFixed(2) + "x", true);
     };
 
-    this.displayScaleXIncrease = function() {
-        setDisplayScale(displayScaleX + wmsx.Monitor.SCALE_STEP, displayScaleY);
+    this.displayAspectIncrease = function() {
+        this.displayScale(normalizeAspectX(displayAspectX + wmsx.Monitor.SCALE_STEP), displayScaleY);
+        this.showOSD("Display Aspect: " + displayAspectX.toFixed(2) + "x", true);
     };
 
-    this.displayScaleYDecrease = function() {
-        setDisplayScale(displayScaleX, displayScaleY - wmsx.Monitor.SCALE_STEP);
+    this.displayScaleDecrease = function() {
+        this.displayScale(displayAspectX, normalizeScaleY(displayScaleY - wmsx.Monitor.SCALE_STEP));
+        this.showOSD("Display Size: " + displayScaleY.toFixed(2) + "x", true);
     };
 
-    this.displayScaleYIncrease = function() {
-        setDisplayScale(displayScaleX, displayScaleY + wmsx.Monitor.SCALE_STEP);
+    this.displayScaleIncrease = function() {
+        this.displayScale(displayAspectX, normalizeScaleY(displayScaleY + wmsx.Monitor.SCALE_STEP));
+        this.showOSD("Display Size: " + displayScaleY.toFixed(2) + "x", true);
     };
 
-    this.displaySizeDecrease = function() {
-        setDisplayScaleDefaultAspect(displayScaleY - wmsx.Monitor.SCALE_STEP);
+    this.getScreenText = function() {
+        return videoSignal.getScreenText();
     };
 
-    this.displaySizeIncrease = function() {
-        setDisplayScaleDefaultAspect(displayScaleY + wmsx.Monitor.SCALE_STEP);
+    this.displayScale = function(aspectX, scaleY) {
+        displayAspectX = aspectX;
+        displayScaleY = scaleY;
+        display.displayScale(displayAspectX, displayScaleY);
     };
 
-    var setDisplayScale = function(x, y) {
-        displayScaleX = x;
-        if (displayScaleX < 0.5) displayScaleX = 0.5;
-        displayScaleY = y;
-        if (displayScaleY < 0.5) displayScaleY = 0.5;
-        if (!display) return;
-        display.displayScale(displayScaleX, displayScaleY);
-        //display.displayMinimumSize((wmsx.Monitor.BASE_WIDTH * wmsx.Monitor.DEFAULT_SCALE_X / wmsx.Monitor.DEFAULT_SCALE_Y) | 0, wmsx.Monitor.BASE_HEIGHT);
-    };
+    function normalizeAspectX(aspectX) {
+        var ret = aspectX < 0.5 ? 0.5 : aspectX > 2.5 ? 2.5 : aspectX;
+        return Math.round(ret * 10) / 10;
+    }
 
-    var setDisplayScaleDefaultAspect = function(y) {
-        var scaleY = y;
-        if (scaleY < 0.5) scaleY = 0.5;
-        setDisplayScale(scaleY * wmsx.Monitor.DEFAULT_SCALE_ASPECT_X, scaleY);
-    };
-
-    var crtSetModeForCartridges = function(cartridge1, cartridge2) {
-        // Only change mode if in Default is in AUTO (not forced)
-        if (CRT_MODE === -1 && (crtMode === 0 || crtMode === 1)) {
-            var cart = cartridge1 || cartridge2;
-            setCrtMode(!cart ? 0 : cart.rom.info.crt || 0);
-        }
-    };
-
-    var displayCenter = function() {
-        if (display) display.displayCenter();
-    };
-
-    var crtModeSetDefault = function() {
-        setCrtMode(CRT_MODE < 0 ? 0 : CRT_MODE);
-    };
-
-    var setCrtMode = function(mode) {
-        var newMode = mode > 4 || mode < 0 ? 0 : mode;
-        if (crtMode === newMode) return;
-        crtMode = newMode;
-    };
+    function normalizeScaleY(scaleY) {
+        var ret = scaleY < 0.5 ? 0.5 : scaleY;
+        return Math.round(ret * 10) / 10;
+    }
 
 
     var videoSignal;
-    var cartridgeSocket;
 
-    var displayScaleX;
+    var displayAspectX;
     var displayScaleY;
-
-    var debug = 0;
-
-    var CRT_MODE = WMSX.SCREEN_CRT_MODE;
-    var CRT_MODE_NAMES = [ "OFF", "Phosphor", "Phosphor Scanlines", "RGB", "RGB Phosphor" ];
-
-    var crtMode = -1;
-
-
-    init(this);
 
 };
 
-wmsx.Monitor.DEFAULT_SCALE_ASPECT_X = 1;
-wmsx.Monitor.SCALE_STEP = 0.125;
+wmsx.Monitor.SCALE_STEP = 0.1;
 
 

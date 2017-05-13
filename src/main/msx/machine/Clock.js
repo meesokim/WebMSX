@@ -1,32 +1,39 @@
 // Copyright 2015 by Paulo Augusto Peccin. See license.txt distributed with this file.
 
-wmsx.Clock = function(clockDriven) {
+// Clock Pulse generator. Intended to be synchronized with Host machine Video Frequency whenever possible
+
+wmsx.Clock = function(clockPulse) {
+"use strict";
 
     this.go = function() {
         if (!running) {
-            //lastPulseTime = window.performance.now();
+            //lastPulseTime = wmsx.Util.performanceNow();
             //timeMeasures = [];
 
             useRequestAnimationFrame = vSynch && (cyclesPerSecond === wmsx.Clock.HOST_NATIVE_FPS);
 
             running = true;
             if (useRequestAnimationFrame)
-                animationFrame = window.requestAnimationFrame(pulse);
+                animationFrame = requestAnimationFrame(pulse);
             else
-                interval = window.setInterval(pulse, cycleTimeMs);
+                interval = setInterval(pulse, cycleTimeMs);
         }
     };
 
     this.pause = function() {
         running = false;
         if (animationFrame) {
-            window.cancelAnimationFrame(animationFrame);
+            cancelAnimationFrame(animationFrame);
             animationFrame = null;
         }
         if (interval) {
-            window.clearInterval(interval);
+            clearInterval(interval);
             interval = null;
         }
+    };
+
+    this.isRunning = function() {
+        return running;
     };
 
     this.getFrequency = function() {
@@ -59,16 +66,16 @@ wmsx.Clock = function(clockDriven) {
     };
 
     var pulse = function() {
-        //var pulseTime = window.performance.now();
+        //var pulseTime = wmsx.Util.performanceNow();
         //timeMeasures[timeMeasures.length] = pulseTime - lastPulseTime;
         //lastPulseTime = pulseTime;
 
         animationFrame = null;
-        clockDriven.clockPulse();
+        clockPulse();
         if (useRequestAnimationFrame && !animationFrame)
-            animationFrame = window.requestAnimationFrame(pulse);
+            animationFrame = requestAnimationFrame(pulse);
 
-        //console.log(window.performance.now() - pulseTime);
+        //console.log(wmsx.Util.performanceNow() - pulseTime);
     };
 
     //this.getMeasures = function() {
@@ -81,7 +88,6 @@ wmsx.Clock = function(clockDriven) {
 
 
     var running = false;
-
 
     var cyclesPerSecond = 1;
     var cycleTimeMs = 1000;
@@ -99,14 +105,14 @@ wmsx.Clock.HOST_NATIVE_FPS = WMSX.SCREEN_FORCE_HOST_NATIVE_FPS;         // -1 = 
 
 wmsx.Clock.detectHostNativeFPSAndCallback = function(callback) {
 
-    if (WMSX.SCREEN_VSYNCH_MODE === 0) {
-        wmsx.Util.log("Video native V-Synch disabled");
+    if (WMSX.SCREEN_VSYNCH_MODE === -1) {
+        wmsx.Util.warning("Video native V-Synch disabled in configuration");
         if (callback) callback(wmsx.Clock.HOST_NATIVE_FPS);
         return;
     }
 
-    // Bypass if already detected or forced
-    if (WMSX.SCREEN_VSYNCH_MODE === 0|| (wmsx.Clock.HOST_NATIVE_FPS !== -1)) {
+    if (wmsx.Clock.HOST_NATIVE_FPS !== -1) {
+        wmsx.Util.warning("Host video frequency forced in configuration: " + wmsx.Clock.HOST_NATIVE_FPS);
         if (callback) callback(wmsx.Clock.HOST_NATIVE_FPS);
         return;
     }
@@ -116,33 +122,35 @@ wmsx.Clock.detectHostNativeFPSAndCallback = function(callback) {
     var tries = 0;
     var samples = [];
     var lastTime = 0;
-    var good60 = 0, good50 = 0;
+    var good60 = 0, good50 = 0, good120 = 0, good100 = 0;
     var tolerance = 0.06;
 
     var sampler = function() {
 
         // Detected?
-        if (good60 >= 8 || good50 >= 8) {
-            wmsx.Clock.HOST_NATIVE_FPS = good60 >= 8 ? 60 : 50;
+        if (good60 >= 10 || good50 >= 10 || good120 >= 10 || good100 >= 10) {
+            wmsx.Clock.HOST_NATIVE_FPS = good60 >= 10 ? 60 : good50 >= 10 ? 50 : good120 >= 10 ? 120 : 100;
             wmsx.Util.log("Video native frequency detected: " + wmsx.Clock.HOST_NATIVE_FPS + "Hz");
             if (callback) callback(wmsx.Clock.HOST_NATIVE_FPS);
             return;
         }
 
         tries++;
-        if (tries <= 30) {
-            var currentTime = window.performance.now();
+        if (tries <= 50) {
+            var currentTime = wmsx.Util.performanceNow();
             var sample = currentTime - lastTime;
             samples[samples.length] = sample;
             lastTime = currentTime;
 
-            if ((sample >= (1000 / 60) * (1 - tolerance)) && (sample <= (1000 / 60) * (1 + tolerance))) good60++;
-            if ((sample >= (1000 / 50) * (1 - tolerance)) && (sample <= (1000 / 50) * (1 + tolerance))) good50++;
+            if ((sample >= (1000 / 60) *  (1 - tolerance)) && (sample <= (1000 / 60) *  (1 + tolerance))) good60++;
+            if ((sample >= (1000 / 50) *  (1 - tolerance)) && (sample <= (1000 / 50) *  (1 + tolerance))) good50++;
+            if ((sample >= (1000 / 120) * (1 - tolerance)) && (sample <= (1000 / 120) * (1 + tolerance))) good120++;
+            if ((sample >= (1000 / 100) * (1 - tolerance)) && (sample <= (1000 / 100) * (1 + tolerance))) good100++;
 
-            window.requestAnimationFrame(sampler);
+            requestAnimationFrame(sampler);
         } else {
             wmsx.Clock.HOST_NATIVE_FPS = -1;
-            wmsx.Util.log("Video native frequency detected: unsupported. V-Synch disabled");
+            wmsx.Util.error("Could not detect video native frequency. V-Synch DISABLED!");
             if (callback) callback(wmsx.Clock.HOST_NATIVE_FPS);
         }
     };

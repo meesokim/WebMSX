@@ -1,18 +1,21 @@
 // Copyright 2015 by Paulo Augusto Peccin. See license.txt distributed with this file.
 
-wmsx.PPI = function(audioOutput) {
+wmsx.PPI = function(psgAudioChannel, controllersSocket) {
+"use strict";
 
     this.connectBus = function(pBus) {
         bus = pBus;
-        bus.connectInputDevice(0xa8,  this.inputA8);
+        bus.connectInputDevice( 0xa8, this.inputA8);
         bus.connectOutputDevice(0xa8, this.outputA8);
-        bus.connectInputDevice(0xa9,  this.inputA9);
-        bus.connectInputDevice(0xaa,  this.inputAA);
+        bus.connectInputDevice( 0xa9, this.inputA9);
+        bus.connectOutputDevice(0xa9, wmsx.DeviceMissing.outputPortIgnored);
+        bus.connectInputDevice( 0xaa, this.inputAA);
         bus.connectOutputDevice(0xaa, this.outputAA);
+        bus.connectInputDevice( 0xab, wmsx.DeviceMissing.inputPortIgnored);
         bus.connectOutputDevice(0xab, this.outputAB);
     };
 
-    this.powerOn = function(paused) {
+    this.powerOn = function() {
     };
 
     this.powerOff = function() {
@@ -27,7 +30,7 @@ wmsx.PPI = function(audioOutput) {
     };
 
     this.inputA9 = function() {
-        return keyboardRowValues[keyboardRowSelected];
+        return controllersSocket.readKeyboardPort(keyboardRowSelected);
     };
 
     this.inputAA = function() {
@@ -53,30 +56,18 @@ wmsx.PPI = function(audioOutput) {
         }
     };
 
-    this.keyboardReset = function() {
-        wmsx.Util.arrayFill(keyboardRowValues, 0xff);
-    };
-
     function updateKeyboardConfig() {
         keyboardRowSelected = registerC & 0x0f;
         if (keyClickSignal === ((registerC & 0x80) > 0)) return;
         keyClickSignal = !keyClickSignal;
-        audioOutput.setExternalSignalValue(keyClickSignal ? KEY_CLICK_AUDIO_VALUE : 0);
+        psgAudioChannel.setPulseSignal(keyClickSignal);
     }
 
     function updateCassetteSignal() {
         if (keyClickSignal === ((registerC & 0x20) > 0)) return;
         casseteSignal = !casseteSignal;
-        audioOutput.setExternalSignalValue(casseteSignal ? KEY_CLICK_AUDIO_VALUE : 0);
+        psgAudioChannel.setPulseSignal(casseteSignal);
     }
-
-
-    // Keyboard Socket interface
-
-    this.keyboardKeyChanged = function(key, press) {
-        if (press) keyboardRowValues[key[0]] &= ~(1 << key[1]);
-        else keyboardRowValues[key[0]] |= (1 << key[1]);
-    };
 
 
     var registerC = 0;
@@ -84,11 +75,8 @@ wmsx.PPI = function(audioOutput) {
     var casseteSignal = false;
 
     var keyboardRowSelected = 0;
-    var keyboardRowValues = wmsx.Util.arrayFill(new Array(16), 0xff);            // only 11 rows used
 
     var bus;
-
-    var KEY_CLICK_AUDIO_VALUE = 0.24;
 
 
     // Savestate  -------------------------------------------
@@ -103,7 +91,6 @@ wmsx.PPI = function(audioOutput) {
         registerC = s.c || 0;
         updateKeyboardConfig(registerC);
         updateCassetteSignal(registerC);
-        keyboardRowValues = wmsx.Util.arrayFill(new Array(16), 0xff);
     };
 
 };

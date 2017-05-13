@@ -1,35 +1,55 @@
 // Copyright 2015 by Paulo Augusto Peccin. See license.txt distributed with this file.
 
-// ROMs with (n >= 2) * 16K banks, mapped in 2 16K banks starting at 0x4000
-wmsx.CartridgeASCII16K = function(rom) {
+// ROMs with n * 16K banks, mapped in 2 16K banks starting at 0x4000
+// Support for normal ASCII16 ROMS and MSX Write (extra switching addresses)
+// 0x4000 - 0xbfff
+
+wmsx.CartridgeASCII16K = function(rom, format) {
+"use strict";
 
     function init(self) {
         self.rom = rom;
-        var content = self.rom.content;
-        bytes = new Array(content.length);
+        bytes = wmsx.Util.asNormalArray(rom.content);
         self.bytes = bytes;
-        for(var i = 0, len = content.length; i < len; i++)
-            bytes[i] = content[i];
-        numBanks = (content.length / 16384) | 0;
+        numBanks = (bytes.length / 16384) | 0;
+        setExtraSwicthes(format);
     }
 
     this.powerOn = function() {
-        bank1Offset = bank2Offset = -0x4000;
+        this.reset();
+    };
+
+    this.reset = function() {
+        bank1Offset = -0x4000; bank2Offset = -0x8000;
     };
 
     this.write = function(address, value) {
-        if (address >= 0x6000 && address < 0x7000)
-            bank1Offset = (value % numBanks) * 0x4000 - 0x4000;
-        else if (address >= 0x7000 && address < 0x8000)
-            bank2Offset = (value % numBanks) * 0x4000 - 0x8000;
+        if ((address >= 0x6000 && address < 0x6800) || address === extraBank1Switch) {
+            bank1Offset = ((value % numBanks) << 14) - 0x4000;
+            return;
+        }
+        if ((address >= 0x7000 && address < 0x7800) || address === extraBank2Switch)
+            bank2Offset = ((value % numBanks) << 14) - 0x8000;
     };
 
     this.read = function(address) {
+        if (address < 0x4000)
+            return 0xff;
         if (address < 0x8000)
-            return bytes[bank1Offset + address];    // May underflow if address < 0x4000
-        else
+            return bytes[bank1Offset + address];
+        if (address < 0xc000)
             return bytes[bank2Offset + address];
+        return 0xff;
     };
+
+    function setExtraSwicthes(format) {
+        if (format === wmsx.SlotFormats.MSXWrite) {
+            extraBank1Switch = 0x6fff;
+            extraBank2Switch = 0x7fff;
+        } else {
+            extraBank1Switch = -1; extraBank2Switch = -1;
+        }
+    }
 
 
     var bytes;
@@ -39,8 +59,10 @@ wmsx.CartridgeASCII16K = function(rom) {
     var bank2Offset;
     var numBanks;
 
+    var extraBank1Switch, extraBank2Switch;
+
     this.rom = null;
-    this.format = wmsx.SlotFormats.ASCII16;
+    this.format = format;
 
 
     // Savestate  -------------------------------------------
@@ -49,7 +71,7 @@ wmsx.CartridgeASCII16K = function(rom) {
         return {
             f: this.format.name,
             r: this.rom.saveState(),
-            b: wmsx.Util.compressUInt8ArrayToStringBase64(bytes),
+            b: wmsx.Util.compressInt8BitArrayToStringBase64(bytes),
             b1: bank1Offset,
             b2: bank2Offset,
             n: numBanks
@@ -57,11 +79,14 @@ wmsx.CartridgeASCII16K = function(rom) {
     };
 
     this.loadState = function(s) {
+        this.format = wmsx.SlotFormats[s.f];
         this.rom = wmsx.ROM.loadState(s.r);
-        bytes = wmsx.Util.uncompressStringBase64ToUInt8Array(s.b);
+        bytes = wmsx.Util.uncompressStringBase64ToInt8BitArray(s.b, bytes);
+        this.bytes = bytes;
         bank1Offset = s.b1;
         bank2Offset = s.b2;
         numBanks = s.n;
+        setExtraSwicthes(this.format);
     };
 
 
@@ -71,8 +96,8 @@ wmsx.CartridgeASCII16K = function(rom) {
 
 wmsx.CartridgeASCII16K.prototype = wmsx.Slot.base;
 
-wmsx.CartridgeASCII16K.createFromSaveState = function(state) {
-    var cart = new wmsx.CartridgeASCII16K();
+wmsx.CartridgeASCII16K.recreateFromSaveState = function(state, previousSlot) {
+    var cart = previousSlot || new wmsx.CartridgeASCII16K();
     cart.loadState(state);
     return cart;
 };

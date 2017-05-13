@@ -1,42 +1,53 @@
 // Copyright 2015 by Paulo Augusto Peccin. See license.txt distributed with this file.
 
-// ROMs with (n >= 4) * 8K banks, mapped in 4 8K banks starting at 0x4000
+// ROMs with n * 8K banks, mapped in 4 8K banks starting at 0x4000
+// 0x4000 - 0xbfff
+
 wmsx.CartridgeASCII8K = function(rom) {
+"use strict";
 
     function init(self) {
         self.rom = rom;
-        var content = self.rom.content;
-        bytes = new Array(content.length);
+        bytes = wmsx.Util.asNormalArray(rom.content);
         self.bytes = bytes;
-        for(var i = 0, len = content.length; i < len; i++)
-            bytes[i] = content[i];
-        numBanks = (content.length / 8192) | 0;
+        numBanks = (bytes.length / 8192) | 0;
     }
 
     this.powerOn = function() {
-        bank1Offset = bank2Offset = bank3Offset = bank4Offset = -0x4000;
+        this.reset();
+    };
+
+    this.reset = function() {
+        bank1Offset = -0x4000; bank2Offset = -0x6000; bank3Offset = -0x8000; bank4Offset = -0xa000;
     };
 
     this.write = function(address, value) {
-        if (address >= 0x6000 && address < 0x6800)
-            bank1Offset = (value % numBanks) * 0x2000 - 0x4000;
-        else if (address >= 0x6800 && address < 0x7000)
-            bank2Offset = (value % numBanks) * 0x2000 - 0x6000;
-        else if (address >= 0x7000 && address < 0x7800)
-            bank3Offset = (value % numBanks) * 0x2000 - 0x8000;
-        else if (address >= 0x7800 && address < 0x8000)
-            bank4Offset = (value % numBanks) * 0x2000 - 0xa000;
+        if (address < 0x6000)
+            return;
+        if (address < 0x6800) {
+            bank1Offset = ((value % numBanks) << 13) - 0x4000;
+            return;
+        }
+        if (address < 0x7000) {
+            bank2Offset = ((value % numBanks) << 13) - 0x6000;
+            return;
+        }
+        if (address < 0x7800) {
+            bank3Offset = ((value % numBanks) << 13) - 0x8000;
+            return;
+        }
+        if (address < 0x8000)
+            bank4Offset = ((value % numBanks) << 13) - 0xa000;
     };
 
     this.read = function(address) {
-        if (address < 0x6000)
-            return bytes[bank1Offset + address];    // May underflow if address < 0x4000
-        else if (address < 0x8000)
-            return bytes[bank2Offset + address];
-        else if (address < 0xa000)
-            return bytes[bank3Offset + address];
-        else
-            return bytes[bank4Offset + address];
+        switch (address & 0xe000) {
+            case 0x4000: return bytes[bank1Offset + address];
+            case 0x6000: return bytes[bank2Offset + address];
+            case 0x8000: return bytes[bank3Offset + address];
+            case 0xa000: return bytes[bank4Offset + address];
+            default:     return 0xff;
+        }
     };
 
 
@@ -59,7 +70,7 @@ wmsx.CartridgeASCII8K = function(rom) {
         return {
             f: this.format.name,
             r: this.rom.saveState(),
-            b: wmsx.Util.compressUInt8ArrayToStringBase64(bytes),
+            b: wmsx.Util.compressInt8BitArrayToStringBase64(bytes),
             b1: bank1Offset,
             b2: bank2Offset,
             b3: bank3Offset,
@@ -70,7 +81,8 @@ wmsx.CartridgeASCII8K = function(rom) {
 
     this.loadState = function(s) {
         this.rom = wmsx.ROM.loadState(s.r);
-        bytes = wmsx.Util.uncompressStringBase64ToUInt8Array(s.b);
+        bytes = wmsx.Util.uncompressStringBase64ToInt8BitArray(s.b, bytes);
+        this.bytes = bytes;
         bank1Offset = s.b1;
         bank2Offset = s.b2;
         bank3Offset = s.b3;
@@ -85,8 +97,8 @@ wmsx.CartridgeASCII8K = function(rom) {
 
 wmsx.CartridgeASCII8K.prototype = wmsx.Slot.base;
 
-wmsx.CartridgeASCII8K.createFromSaveState = function(state) {
-    var cart = new wmsx.CartridgeASCII8K();
+wmsx.CartridgeASCII8K.recreateFromSaveState = function(state, previousSlot) {
+    var cart = previousSlot || new wmsx.CartridgeASCII8K();
     cart.loadState(state);
     return cart;
 };

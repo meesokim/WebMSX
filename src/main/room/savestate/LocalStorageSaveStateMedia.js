@@ -1,6 +1,7 @@
 // Copyright 2015 by Paulo Augusto Peccin. See license.txt distributed with this file.
 
 wmsx.LocalStorageSaveStateMedia = function() {
+"use strict";
 
     this.connect = function(socket) {
         socket.connectMedia(this);
@@ -8,6 +9,10 @@ wmsx.LocalStorageSaveStateMedia = function() {
 
     this.connectPeripherals = function(pFileDownloader) {
         fileDownloader = pFileDownloader;
+    };
+
+    this.isSlotUsed = function(slot) {
+        return localStorage["wmsxsave" + slot] !== undefined;
     };
 
     this.saveState = function(slot, state) {
@@ -20,38 +25,21 @@ wmsx.LocalStorageSaveStateMedia = function() {
         return buildStateFromData(data);
     };
 
-    this.saveStateFile = function(fileName, state) {
+    this.saveStateFile = function(state) {
         var data = buildDataFromState(state);
-        return data && startDownload(fileName || "WebMSXSave", data);
+        if (data) fileDownloader.startDownloadBinary("WMSX SaveState" + SAVE_STATE_FILE_EXTENSION, data, "System State file");
     };
 
     this.loadStateFile = function(data) {
         return buildStateFromData(data);
     };
 
-    this.saveResourceToFile = function(entry, data) {
-        try {
-            var res = data && JSON.stringify(data);
-            return saveToLocalStorage(entry, res);
-        } catch(ex) {
-            // give up
-        }
-    };
-
-    this.loadResourceFromFile = function(entry) {
-        try {
-            var res = loadFromLocalStorage(entry);
-            return res && JSON.parse(res);
-        } catch(ex) {
-            // give up
-        }
-    };
-
     var saveToLocalStorage = function(entry, data) {
         try {
             localStorage["wmsx" + entry] = data;
             return true;
-        } catch (e) {
+        } catch (ex) {
+            wmsx.Util.error(ex);
             return false;
         }
     };
@@ -59,7 +47,8 @@ wmsx.LocalStorageSaveStateMedia = function() {
     var loadFromLocalStorage = function(entry) {
         try {
             return localStorage["wmsx" + entry];
-        } catch (e) {
+        } catch (ex) {
+            wmsx.Util.warning(ex);
             // give up
         }
     };
@@ -68,6 +57,7 @@ wmsx.LocalStorageSaveStateMedia = function() {
         try {
             return SAVE_STATE_IDENTIFIER + JSON.stringify(state);
         } catch(ex) {
+            wmsx.Util.error(ex);
             // give up
         }
     };
@@ -75,35 +65,31 @@ wmsx.LocalStorageSaveStateMedia = function() {
     var buildStateFromData = function (data) {
         try {
             var id;
-            if (data instanceof Array)
-                id = wmsx.Util.uInt8ArrayToByteString(data, 0, SAVE_STATE_IDENTIFIER.length);
-            else
+            if (typeof data == "string")
                 id = data.substr(0, SAVE_STATE_IDENTIFIER.length);
+            else
+                id = wmsx.Util.int8BitArrayToByteString(data, 0, SAVE_STATE_IDENTIFIER.length);
 
             // Check for the identifier
-            if (id !== SAVE_STATE_IDENTIFIER) return;
+            if (id !== SAVE_STATE_IDENTIFIER && id !== SAVE_STATE_IDENTIFIER_OLD) return;
 
             var stateData;
-            if (data instanceof Array)
-                stateData = wmsx.Util.uInt8ArrayToByteString(data, SAVE_STATE_IDENTIFIER.length);
-            else
+            if (typeof data == "string")
                 stateData = data.slice(SAVE_STATE_IDENTIFIER.length);
+            else
+                stateData = wmsx.Util.int8BitArrayToByteString(data, SAVE_STATE_IDENTIFIER.length);
 
             return stateData && JSON.parse(stateData);
-        } catch(e) {
+        } catch(ex) {
+            wmsx.Util.error(ex);
         }
-    };
-
-    var startDownload = function (fileName, data) {
-        if (fileName) fileName = fileName + SAVE_STATE_FILE_EXTENSION;
-        fileDownloader.startDownload(fileName, data);
-        return true;
     };
 
 
     var fileDownloader;
 
-    var SAVE_STATE_IDENTIFIER = "wmsxsavestate!";
+    var SAVE_STATE_IDENTIFIER = String.fromCharCode(0, 0) + "wmsx" + String.fromCharCode(0, 0) + "state!";     // char 0 so browsers like Safari think the file is binary...  :-(
+    var SAVE_STATE_IDENTIFIER_OLD = "wmsxsavestate!";
     var SAVE_STATE_FILE_EXTENSION = ".wst";
 
 };
